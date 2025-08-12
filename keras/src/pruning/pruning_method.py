@@ -626,17 +626,18 @@ class TaylorPruning(PruningMethod):
         target_layer = None
         target_weight_var = None
         
+        weights_tensor_val = weights.value() if hasattr(weights, 'value') and callable(weights.value) else weights
+
         # Use model.trainable_variables to find weights including nested layers
         for var in model.trainable_variables:
             if hasattr(var, 'shape') and len(var.shape) > 1:  # Skip bias terms
                 # Check if this is the matching weight tensor by shape
-                if ops.shape(var) == ops.shape(weights):
+                if ops.shape(var) == ops.shape(weights_tensor_val):
                     # Additional check: see if values are close (in case of multiple layers with same shape)
                     try:
                         # Extract tensor values for comparison to avoid Variable type issues
                         var_tensor = var.value() if hasattr(var, 'value') and callable(var.value) else var
-                        weights_tensor = weights.value() if hasattr(weights, 'value') and callable(weights.value) else weights
-                        weight_diff = ops.mean(ops.abs(var_tensor - weights_tensor))
+                        weight_diff = ops.mean(ops.abs(var_tensor - weights_tensor_val))
                         if backend.convert_to_numpy(weight_diff) < 1e-6:  # Very close values
                             target_weight_var = var
                             # Find the corresponding layer for context
@@ -649,16 +650,16 @@ class TaylorPruning(PruningMethod):
                                 class DummyLayer:
                                     def __init__(self, name):
                                         self.name = name
-                                target_layer = DummyLayer(f"weight_tensor_{ops.shape(weights)}")
+                                target_layer = DummyLayer(f"weight_tensor_{ops.shape(weights_tensor_val)}")
                             break
                     except:
                         # If comparison fails, still use this variable if shapes match
                         target_weight_var = var
-                        target_layer = DummyLayer(f"weight_tensor_{ops.shape(weights)}")
+                        target_layer = DummyLayer(f"weight_tensor_{ops.shape(weights_tensor_val)}")
                         break
         
         if target_layer is None or target_weight_var is None:
-            raise ValueError(f"Could not find layer corresponding to weight tensor with shape {ops.shape(weights)}")
+            raise ValueError(f"Could not find layer corresponding to weight tensor with shape {ops.shape(weights_tensor_val)}")
         
         # Use backend-specific gradient computation for efficiency and accuracy
         from keras.src import backend as keras_backend
@@ -683,7 +684,7 @@ class TaylorPruning(PruningMethod):
                 # Explicitly watch the target weight variable
                 if hasattr(target_weight_var, 'value'):
                     # Keras Variable - watch the underlying tensor
-                    watch_var = target_weight_var.value
+                    watch_var = target_weight_var.value()
                 else:
                     # Already a TensorFlow tensor/variable
                     watch_var = target_weight_var
@@ -726,7 +727,7 @@ class TaylorPruning(PruningMethod):
             
             # Compute gradients using JAX
             grad_fn = jax.grad(compute_loss_fn)
-            gradients = grad_fn(weights)
+            gradients = grad_fn(weights_tensor_val)
             
             # Approximate Hessian diagonal using gradient magnitude
             # This is a simplified approximation when full second-order computation is too expensive
@@ -738,7 +739,7 @@ class TaylorPruning(PruningMethod):
             
             # For Keras variables, get the underlying tensor
             if hasattr(target_weight_var, 'value'):
-                torch_var = target_weight_var.value
+                torch_var = target_weight_var.value()
             else:
                 torch_var = target_weight_var
                 
@@ -769,7 +770,7 @@ class TaylorPruning(PruningMethod):
             epsilon = 1e-7
             
             def compute_loss_with_weights(layer_weights):
-                old_weights = target_layer.kernel.value
+                old_weights = target_layer.kernel.value()
                 target_layer.kernel.assign(layer_weights)
                 
                 predictions = model(x_data, training=False)
@@ -784,10 +785,10 @@ class TaylorPruning(PruningMethod):
                 return loss_scalar
             
             # Numerical gradient computation
-            baseline_loss = compute_loss_with_weights(weights)
-            gradients = ops.zeros_like(weights)
+            baseline_loss = compute_loss_with_weights(weights_tensor_val)
+            gradients = ops.zeros_like(weights_tensor_val)
             
-            flat_weights = ops.reshape(weights, [-1])
+            flat_weights = ops.reshape(weights_tensor_val, [-1])
             flat_gradients = ops.reshape(gradients, [-1])
             
             # Sample subset for efficiency
@@ -800,7 +801,7 @@ class TaylorPruning(PruningMethod):
                 # Forward difference
                 perturbed_weights = ops.copy(flat_weights)
                 perturbed_weights = ops.slice_update(perturbed_weights, [i], [flat_weights[i] + epsilon])
-                perturbed_weights_reshaped = ops.reshape(perturbed_weights, ops.shape(weights))
+                perturbed_weights_reshaped = ops.reshape(perturbed_weights, ops.shape(weights_tensor_val))
                 
                 perturbed_loss = compute_loss_with_weights(perturbed_weights_reshaped)
                 grad_val = (perturbed_loss - baseline_loss) / epsilon
@@ -816,7 +817,7 @@ class TaylorPruning(PruningMethod):
                 if i not in indices:
                     flat_gradients_np[i] = backend.convert_to_numpy(ops.abs(flat_weights[i]))
             
-            gradients = ops.convert_to_tensor(flat_gradients_np.reshape(backend.convert_to_numpy(ops.shape(weights))), dtype=weights.dtype)
+            gradients = ops.convert_to_tensor(flat_gradients_np.reshape(backend.convert_to_numpy(ops.shape(weights_tensor_val))), dtype=weights_tensor_val.dtype)
             # For numerical fallback, use simple gradient-based approximation
             hessian_diag_approx = ops.abs(gradients) + 1e-8
         
@@ -826,15 +827,11 @@ class TaylorPruning(PruningMethod):
         # for curvature, which is a common heuristic in pruning literature.
         
         # Ensure we use tensor values, not Variable objects
-        if hasattr(gradients, 'value'):
-            gradients = gradients.value
-        if hasattr(weights, 'value'):
-            weights = weights.value
-        if hasattr(hessian_diag_approx, 'value'):
-            hessian_diag_approx = hessian_diag_approx.value
+        gradients_val = gradients.value() if hasattr(gradients, 'value') and callable(gradients.value) else gradients
+        hessian_diag_approx_val = hessian_diag_approx.value() if hasattr(hessian_diag_approx, 'value') and callable(hessian_diag_approx.value) else hessian_diag_approx
             
-        first_order_term = ops.abs(gradients * weights)  # |∂L/∂w * w|
-        second_order_term = 0.5 * ops.abs(hessian_diag_approx * ops.square(weights))  # Approximated second-order term
+        first_order_term = ops.abs(gradients_val * weights_tensor_val)  # |∂L/∂w * w|
+        second_order_term = 0.5 * ops.abs(hessian_diag_approx_val * ops.square(weights_tensor_val))  # Approximated second-order term
         
         taylor_scores = first_order_term + second_order_term
         
