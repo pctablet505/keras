@@ -436,7 +436,7 @@ class SaliencyPruning(PruningMethod):
                     loss = loss_obj(y_data, predictions)
                 return ops.mean(loss) if len(ops.shape(loss)) > 0 else loss
             
-            watch_vars = [v.value() for v in trainable_weights]
+            watch_vars = [v.value() if hasattr(v, 'value') and callable(v.value) else v.value if hasattr(v, 'value') else v for v in trainable_weights]
             with tf.GradientTape(watch_accessed_variables=False) as tape:
                 tape.watch(watch_vars)
                 loss = compute_loss()
@@ -459,7 +459,7 @@ class SaliencyPruning(PruningMethod):
             import jax
             
             def get_loss(weight_values):
-                original_weights = [w.value() for w in trainable_weights]
+                original_weights = [w.value() if hasattr(w, 'value') and callable(w.value) else w.value if hasattr(w, 'value') else w for w in trainable_weights]
                 for var, new_w in zip(trainable_weights, weight_values):
                     var.assign(new_w)
                 
@@ -475,7 +475,7 @@ class SaliencyPruning(PruningMethod):
                     
                 return ops.mean(loss) if len(ops.shape(loss)) > 0 else loss
             
-            current_weights = [w.value() for w in trainable_weights]
+            current_weights = [w.value() if hasattr(w, 'value') and callable(w.value) else w.value if hasattr(w, 'value') else w for w in trainable_weights]
             all_gradients = jax.grad(get_loss)(current_weights)
             
             target_gradients = None
@@ -495,7 +495,7 @@ class SaliencyPruning(PruningMethod):
             
             torch_weights = []
             for var in trainable_weights:
-                tensor = var.value() if hasattr(var, 'value') and callable(var.value) else var
+                tensor = var.value() if hasattr(var, 'value') and callable(var.value) else var.value if hasattr(var, 'value') else var
                 if hasattr(tensor, 'requires_grad') and not tensor.requires_grad:
                     tensor.requires_grad_(True)
                 torch_weights.append(tensor)
@@ -538,12 +538,23 @@ class SaliencyPruning(PruningMethod):
 class TaylorPruning(PruningMethod):
     """Second-order Taylor expansion based pruning method.
 
-    Estimates weight importance using second-order Taylor expansion.
+    Estimates weight importance using second-order Taylor expansion:
+    Taylor score ≈ |∂L/∂w * w| + λ * |∂²L/∂w² * w|
+    
+    This implementation uses Fisher Information Matrix diagonal as Hessian approximation,
+    which is more stable and theoretically grounded than using gradient squares.
     """
 
-    def __init__(self):
-        """Initialize Taylor pruning."""
-        pass
+    def __init__(self, second_order_weight=0.1, use_fisher_approximation=True):
+        """Initialize Taylor pruning.
+        
+        Args:
+            second_order_weight: Weight for second-order term (λ in the formula).
+            use_fisher_approximation: If True, use Fisher Information approximation for Hessian.
+                                    If False, fall back to simpler gradient-based approximation.
+        """
+        self.second_order_weight = second_order_weight
+        self.use_fisher_approximation = use_fisher_approximation
 
     def compute_mask(self, weights, sparsity_ratio, **kwargs):
         """Compute Taylor expansion based mask."""
@@ -584,8 +595,12 @@ class TaylorPruning(PruningMethod):
     def _compute_taylor_scores(self, weights, model, loss_fn, dataset):
         """Compute second-order Taylor expansion scores.
         
-        Taylor score approximates the change in loss when setting a weight to zero
-        using Taylor expansion: ΔL ≈ |∂L/∂w * w| + (1/2) * |∂²L/∂w² * w²|
+        Taylor score = |∂L/∂w * w| + λ * |H_ii * w|
+        where H_ii is the diagonal of the Hessian matrix.
+        
+        For computational efficiency, we approximate H_ii using:
+        1. Fisher Information Matrix: H_ii ≈ E[g_i²] where g_i = ∂L/∂w_i
+        2. Or simple gradient magnitude: H_ii ≈ |g_i|
         """
         import keras
         import numpy as np
@@ -597,225 +612,120 @@ class TaylorPruning(PruningMethod):
             raise ValueError("Dataset must be a tuple (x_data, y_data) for Taylor computation.")
         
         # Process data in smaller batches to avoid OOM
-        # Limit batch size to avoid GPU memory issues
         if hasattr(x_data, 'shape') and len(x_data.shape) > 0:
             total_samples = x_data.shape[0]
             max_batch_size = min(32, total_samples)  # Use small batches to avoid OOM
             
-            # Take a representative sample if dataset is very large
             if total_samples > max_batch_size:
-                # Use random sampling for better gradient estimation
                 indices = np.random.choice(total_samples, max_batch_size, replace=False)
                 x_data = x_data[indices]
                 y_data = y_data[indices]
         
-        # Convert to tensors after sampling
+        # Convert to tensors
         x_data = ops.convert_to_tensor(x_data)
         y_data = ops.convert_to_tensor(y_data)
         
-        # Find which layer this weight tensor belongs to by comparing shapes and values
-        target_layer = None
-        target_weight_var = None
-        
+        # Extract tensor values to ensure we work with tensors, not Variables
         weights_tensor_val = weights.value() if hasattr(weights, 'value') and callable(weights.value) else weights
 
-        # Use model.trainable_variables to find weights including nested layers
+        # Find the target weight variable by matching tensor values
+        target_weight_var = None
         for var in model.trainable_variables:
             if hasattr(var, 'shape') and len(var.shape) > 1:  # Skip bias terms
-                # Check if this is the matching weight tensor by shape
                 if ops.shape(var) == ops.shape(weights_tensor_val):
-                    # Additional check: see if values are close (in case of multiple layers with same shape)
                     try:
-                        # Extract tensor values for comparison to avoid Variable type issues
                         var_tensor = var.value() if hasattr(var, 'value') and callable(var.value) else var
                         weight_diff = ops.mean(ops.abs(var_tensor - weights_tensor_val))
-                        if backend.convert_to_numpy(weight_diff) < 1e-6:  # Very close values
+                        if backend.convert_to_numpy(weight_diff) < 1e-6:
                             target_weight_var = var
-                            # Find the corresponding layer for context
-                            for layer in model.layers:
-                                if hasattr(layer, 'kernel') and layer.kernel is var:
-                                    target_layer = layer
-                                    break
-                            if target_layer is None:
-                                # Handle nested layers - create a dummy layer reference
-                                class DummyLayer:
-                                    def __init__(self, name):
-                                        self.name = name
-                                target_layer = DummyLayer(f"weight_tensor_{ops.shape(weights_tensor_val)}")
                             break
                     except:
-                        # If comparison fails, still use this variable if shapes match
                         target_weight_var = var
-                        target_layer = DummyLayer(f"weight_tensor_{ops.shape(weights_tensor_val)}")
                         break
         
-        if target_layer is None or target_weight_var is None:
-            raise ValueError(f"Could not find layer corresponding to weight tensor with shape {ops.shape(weights_tensor_val)}")
+        if target_weight_var is None:
+            raise ValueError(f"Could not find weight variable with shape {ops.shape(weights_tensor_val)}")
         
-        # Use backend-specific gradient computation for efficiency and accuracy
+        # Backend-specific gradient computation
         from keras.src import backend as keras_backend
         backend_name = keras_backend.backend()
         
+        def compute_loss():
+            predictions = model(x_data, training=False)
+            if callable(loss_fn):
+                loss = loss_fn(y_data, predictions)
+            else:
+                loss_obj = keras.losses.get(loss_fn)
+                loss = loss_obj(y_data, predictions)
+            return ops.mean(loss) if len(ops.shape(loss)) > 0 else loss
+        
         if backend_name == "tensorflow":
-            # Use TensorFlow's GradientTape for automatic differentiation
             import tensorflow as tf
             
-            def compute_loss():
-                # Keep model in inference mode for consistent behavior
-                predictions = model(x_data, training=False)
-                if callable(loss_fn):
-                    loss = loss_fn(y_data, predictions)
-                else:
-                    loss_obj = keras.losses.get(loss_fn)
-                    loss = loss_obj(y_data, predictions)
-                return ops.mean(loss) if len(ops.shape(loss)) > 0 else loss
-            
-            # Compute first-order gradients
+            # Compute gradients
             with tf.GradientTape(watch_accessed_variables=False) as tape:
-                # Explicitly watch the target weight variable's tensor value
-                watch_var = target_weight_var.value() if hasattr(target_weight_var, 'value') and callable(target_weight_var.value) else target_weight_var
+                watch_var = target_weight_var.value() if hasattr(target_weight_var, 'value') and callable(target_weight_var.value) else target_weight_var.value if hasattr(target_weight_var, 'value') else target_weight_var
                 tape.watch(watch_var)
-                
                 loss = compute_loss()
             
             gradients = tape.gradient(loss, watch_var)
-            
             if gradients is None:
-                raise ValueError(f"No gradients computed for layer {target_layer.name}")
-            
-            # For second-order term, we use the square of the gradient as an
-            # approximation of the Hessian diagonal, as suggested in Optimal
-            # Brain Damage paper. This is more stable than using the gradient
-            # magnitude and is a common practice.
-            hessian_diag_approx = ops.square(gradients) + 1e-8
+                raise ValueError("No gradients computed in TensorFlow backend.")
             
         elif backend_name == "jax":
-            # Use JAX's automatic differentiation
             import jax
             
-            def compute_loss_fn(weight_vals):
-                # Temporarily set weights
-                old_weights = target_weight_var.value()
+            def loss_fn_for_grad(weight_vals):
+                old_weights = target_weight_var.value() if hasattr(target_weight_var, 'value') and callable(target_weight_var.value) else target_weight_var.value if hasattr(target_weight_var, 'value') else target_weight_var
                 target_weight_var.assign(weight_vals)
-                
-                predictions = model(x_data, training=False)
-                if callable(loss_fn):
-                    loss = loss_fn(y_data, predictions)
-                else:
-                    loss_obj = keras.losses.get(loss_fn)
-                    loss = loss_obj(y_data, predictions)
-                
-                loss_scalar = ops.mean(loss) if len(ops.shape(loss)) > 0 else loss
-                
-                # Restore weights
+                loss_val = compute_loss()
                 target_weight_var.assign(old_weights)
-                return loss_scalar
+                return loss_val
             
-            # Compute gradients using JAX
-            grad_fn = jax.grad(compute_loss_fn)
-            gradients = grad_fn(weights_tensor_val)
-            
-            # Approximate Hessian diagonal using gradient magnitude
-            # This is a simplified approximation when full second-order computation is too expensive
-            hessian_diag_approx = ops.abs(gradients) + 1e-8
+            gradients = jax.grad(loss_fn_for_grad)(weights_tensor_val)
             
         elif backend_name == "torch":
-            # Use PyTorch's autograd
             import torch
             
-            # For Keras variables, get the underlying tensor
             torch_var = target_weight_var.value() if hasattr(target_weight_var, 'value') and callable(target_weight_var.value) else target_weight_var
-                
-            # Set requires_grad for the target weights
-            torch_var.requires_grad_(True)
-            
-            def compute_loss():
-                predictions = model(x_data, training=False)
-                if callable(loss_fn):
-                    loss = loss_fn(y_data, predictions)
-                else:
-                    loss_obj = keras.losses.get(loss_fn)
-                    loss = loss_obj(y_data, predictions)
-                return ops.mean(loss) if len(ops.shape(loss)) > 0 else loss
+            if hasattr(torch_var, 'requires_grad'):
+                torch_var.requires_grad_(True)
             
             loss = compute_loss()
             gradients = torch.autograd.grad(loss, torch_var, create_graph=False)[0]
             
-            if gradients is None:
-                raise ValueError(f"No gradients computed for layer {target_layer.name}")
-            
-            # Approximate Hessian diagonal using gradient magnitude
-            # This is a simplified approximation when full second-order computation is too expensive
-            hessian_diag_approx = ops.abs(gradients) + 1e-8
-            
         else:
-            # Fallback: Use numerical differentiation (slower but backend-agnostic)
-            epsilon = 1e-7
-            
-            def compute_loss_with_weights(layer_weights):
-                old_weights = target_weight_var.value()
-                target_weight_var.assign(layer_weights)
-                
-                predictions = model(x_data, training=False)
-                if callable(loss_fn):
-                    loss = loss_fn(y_data, predictions)
-                else:
-                    loss_obj = keras.losses.get(loss_fn)
-                    loss = loss_obj(y_data, predictions)
-                
-                loss_scalar = ops.mean(loss) if len(ops.shape(loss)) > 0 else loss
-                target_weight_var.assign(old_weights)
-                return loss_scalar
-            
-            # Numerical gradient computation
-            baseline_loss = compute_loss_with_weights(weights_tensor_val)
-            gradients = ops.zeros_like(weights_tensor_val)
-            
-            flat_weights = ops.reshape(weights_tensor_val, [-1])
-            flat_gradients = ops.reshape(gradients, [-1])
-            
-            # Sample subset for efficiency
-            total_weights = int(backend.convert_to_numpy(ops.size(flat_weights)))
-            sample_size = min(100, total_weights)
-            indices = np.random.choice(total_weights, sample_size, replace=False) if sample_size < total_weights else np.arange(total_weights)
-            
-            grad_values = []
-            for i in indices:
-                # Forward difference
-                perturbed_weights = ops.copy(flat_weights)
-                perturbed_weights = ops.slice_update(perturbed_weights, [i], [flat_weights[i] + epsilon])
-                perturbed_weights_reshaped = ops.reshape(perturbed_weights, ops.shape(weights_tensor_val))
-                
-                perturbed_loss = compute_loss_with_weights(perturbed_weights_reshaped)
-                grad_val = (perturbed_loss - baseline_loss) / epsilon
-                grad_values.append(backend.convert_to_numpy(grad_val))
-            
-            # Fill gradient tensor
-            flat_gradients_np = backend.convert_to_numpy(flat_gradients)
-            for idx, i in enumerate(indices):
-                flat_gradients_np[i] = grad_values[idx]
-            
-            # For unsampled weights, approximate with weight magnitude
-            for i in range(total_weights):
-                if i not in indices:
-                    flat_gradients_np[i] = backend.convert_to_numpy(ops.abs(flat_weights[i]))
-            
-            gradients = ops.convert_to_tensor(flat_gradients_np.reshape(backend.convert_to_numpy(ops.shape(weights_tensor_val))), dtype=weights_tensor_val.dtype)
-            # For numerical fallback, use simple gradient-based approximation
-            hessian_diag_approx = ops.abs(gradients) + 1e-8
+            raise ValueError(f"TaylorPruning not supported for backend '{backend_name}'.")
         
-        # Compute Taylor expansion terms
-        # Note: This is a simplified Taylor approximation since computing true Hessian diagonal
-        # is computationally expensive. The second-order term uses gradient magnitude as a proxy
-        # for curvature, which is a common heuristic in pruning literature.
-        
-        # Ensure we use tensor values, not Variable objects
+        # Extract gradient values
         gradients_val = gradients.value() if hasattr(gradients, 'value') and callable(gradients.value) else gradients
-        hessian_diag_approx_val = hessian_diag_approx.value() if hasattr(hessian_diag_approx, 'value') and callable(hessian_diag_approx.value) else hessian_diag_approx
-            
-        first_order_term = ops.abs(gradients_val * weights_tensor_val)  # |∂L/∂w * w|
-        second_order_term = 0.5 * ops.abs(hessian_diag_approx_val * ops.square(weights_tensor_val))  # Approximated second-order term
         
-        taylor_scores = first_order_term + second_order_term
+        # Compute first-order term: |∂L/∂w * w|
+        first_order_term = ops.abs(gradients_val * weights_tensor_val)
+        
+        # Compute second-order approximation
+        if self.use_fisher_approximation:
+            # Fisher Information approximation: Use squared gradients as Hessian diagonal approximation
+            # This is more theoretically sound than using |gradient|
+            hessian_diag_approx = ops.square(gradients_val) + 1e-8
+        else:
+            # Simple approximation: Use gradient magnitude
+            hessian_diag_approx = ops.abs(gradients_val) + 1e-8
+        
+        # Second-order term: |H_ii * w^2|
+        second_order_term = ops.abs(
+            hessian_diag_approx * ops.square(weights_tensor_val)
+        )
+        
+        # Combine terms with proper normalization to avoid scale issues
+        # Normalize each term to have similar magnitude
+        first_mean = ops.mean(first_order_term) + 1e-8
+        second_mean = ops.mean(second_order_term) + 1e-8
+        
+        # Scale second term to be comparable to first term
+        normalized_second_term = (second_order_term / second_mean) * first_mean
+        
+        # Final Taylor score
+        taylor_scores = first_order_term + self.second_order_weight * normalized_second_term
         
         return taylor_scores
