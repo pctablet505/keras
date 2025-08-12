@@ -351,10 +351,16 @@ class SaliencyPruning(PruningMethod):
 
     def compute_mask(self, weights, sparsity_ratio, **kwargs):
         """Compute saliency-based mask using gradients."""
+        # Ensure we work with tensor values, not Variable objects
+        if hasattr(weights, 'value') and callable(weights.value):
+            weights_tensor = weights.value()
+        else:
+            weights_tensor = weights
+            
         if sparsity_ratio <= 0:
-            return ops.ones_like(weights, dtype="bool")
+            return ops.ones_like(weights_tensor, dtype="bool")
         if sparsity_ratio >= 1:
-            return ops.zeros_like(weights, dtype="bool")
+            return ops.zeros_like(weights_tensor, dtype="bool")
 
         # Get model and data from kwargs (passed by core.py)
         model = kwargs.get('model')
@@ -365,13 +371,13 @@ class SaliencyPruning(PruningMethod):
         loss_fn = _validate_gradient_method_requirements("SaliencyPruning", model, dataset, loss_fn)
 
         # Compute saliency scores (|weight * gradient|)
-        saliency_scores = self._compute_saliency_scores(weights, model, loss_fn, dataset)
+        saliency_scores = self._compute_saliency_scores(weights, model, loss_fn, dataset) # Pass original weights
 
         flat_scores = ops.reshape(saliency_scores, [-1])
         total_size = int(backend.convert_to_numpy(ops.size(flat_scores)))
         k = int(sparsity_ratio * total_size)
         if k == 0:
-            return ops.ones_like(weights, dtype="bool")
+            return ops.ones_like(weights_tensor, dtype="bool")
 
         sorted_scores = ops.sort(flat_scores)
         threshold = sorted_scores[k]
@@ -437,12 +443,24 @@ class SaliencyPruning(PruningMethod):
             with tf.GradientTape(watch_accessed_variables=True, persistent=False) as tape:
                 # Explicitly watch all trainable variables to ensure they're tracked
                 for var in model.trainable_variables:
-                    tape.watch(var)
+                    # Extract tensor value if it's a Keras Variable
+                    if hasattr(var, 'value'):
+                        tape.watch(var.value)
+                    else:
+                        tape.watch(var)
                 
                 loss = compute_loss()
             
             # Get gradients for all trainable variables
-            all_gradients = tape.gradient(loss, trainable_weights)
+            # Need to get the actual tensor values (not Variables) for gradient computation
+            watch_vars = []
+            for var in trainable_weights:
+                if hasattr(var, 'value'):
+                    watch_vars.append(var.value)
+                else:
+                    watch_vars.append(var)
+            
+            all_gradients = tape.gradient(loss, watch_vars)
             
             # Find the gradient for our specific weight tensor
             target_gradients = None
@@ -450,7 +468,10 @@ class SaliencyPruning(PruningMethod):
                 if ops.shape(weight) == ops.shape(weights):
                     # Check if values are close (handles case where multiple layers have same shape)
                     try:
-                        weight_diff = ops.mean(ops.abs(weight - weights))
+                        # Extract tensor values for comparison to avoid Variable type issues
+                        weight_tensor = weight.value() if hasattr(weight, 'value') and callable(weight.value) else weight
+                        weights_param_tensor = weights.value() if hasattr(weights, 'value') and callable(weights.value) else weights
+                        weight_diff = ops.mean(ops.abs(weight_tensor - weights_param_tensor))
                         if backend.convert_to_numpy(weight_diff) < 1e-6:
                             target_gradients = all_gradients[i]
                             break
@@ -496,12 +517,20 @@ class SaliencyPruning(PruningMethod):
         
         # Compute saliency scores: |gradient * weight|
         # Ensure we use tensor values, not Variable objects
+        # Handle TensorFlow Variable extraction properly
+        import tensorflow as tf
+        
+        # For gradients (already extracted from tape)
         if hasattr(gradients, 'value'):
             gradients = gradients.value
-        if hasattr(weights, 'value'):
-            weights = weights.value
             
-        saliency_scores = ops.abs(gradients * weights)
+        # For weights - use the same tensor we used for comparison
+        if hasattr(weights, 'value') and callable(weights.value):
+            weights_tensor = weights.value()
+        else:
+            weights_tensor = weights
+            
+        saliency_scores = ops.abs(gradients * weights_tensor)
         
         return saliency_scores
 
@@ -519,6 +548,10 @@ class TaylorPruning(PruningMethod):
 
     def compute_mask(self, weights, sparsity_ratio, **kwargs):
         """Compute Taylor expansion based mask."""
+        # Ensure we work with tensor values, not Variable objects
+        if hasattr(weights, 'value'):
+            weights = weights.value
+            
         if sparsity_ratio <= 0:
             return ops.ones_like(weights, dtype="bool")
         if sparsity_ratio >= 1:
@@ -590,7 +623,10 @@ class TaylorPruning(PruningMethod):
                 if ops.shape(var) == ops.shape(weights):
                     # Additional check: see if values are close (in case of multiple layers with same shape)
                     try:
-                        weight_diff = ops.mean(ops.abs(var - weights))
+                        # Extract tensor values for comparison to avoid Variable type issues
+                        var_tensor = var.value() if hasattr(var, 'value') and callable(var.value) else var
+                        weights_tensor = weights.value() if hasattr(weights, 'value') and callable(weights.value) else weights
+                        weight_diff = ops.mean(ops.abs(var_tensor - weights_tensor))
                         if backend.convert_to_numpy(weight_diff) < 1e-6:  # Very close values
                             target_weight_var = var
                             # Find the corresponding layer for context
@@ -638,11 +674,10 @@ class TaylorPruning(PruningMethod):
                 if hasattr(target_weight_var, 'value'):
                     # Keras Variable - watch the underlying tensor
                     watch_var = target_weight_var.value
-                    tape.watch(watch_var)
                 else:
                     # Already a TensorFlow tensor/variable
                     watch_var = target_weight_var
-                    tape.watch(watch_var)
+                tape.watch(watch_var)
                 
                 loss = compute_loss()
             
