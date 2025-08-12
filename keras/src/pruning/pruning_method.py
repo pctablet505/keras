@@ -422,6 +422,7 @@ class SaliencyPruning(PruningMethod):
         backend_name = keras_backend.backend()
         
         trainable_weights = [v for v in model.trainable_variables if len(v.shape) > 1]
+        weights_tensor = weights.value() if hasattr(weights, 'value') and callable(weights.value) else weights
 
         if backend_name == "tensorflow":
             import tensorflow as tf
@@ -435,35 +436,30 @@ class SaliencyPruning(PruningMethod):
                     loss = loss_obj(y_data, predictions)
                 return ops.mean(loss) if len(ops.shape(loss)) > 0 else loss
             
-            with tf.GradientTape(watch_accessed_variables=True) as tape:
-                for var in model.trainable_variables:
-                    if hasattr(var, 'value'):
-                        tape.watch(var.value)
-                    else:
-                        tape.watch(var)
+            watch_vars = [v.value() for v in trainable_weights]
+            with tf.GradientTape(watch_accessed_variables=False) as tape:
+                tape.watch(watch_vars)
                 loss = compute_loss()
             
-            watch_vars = [v.value if hasattr(v, 'value') else v for v in trainable_weights]
             all_gradients = tape.gradient(loss, watch_vars)
             
             target_gradients = None
             for i, weight in enumerate(trainable_weights):
-                if ops.shape(weight) == ops.shape(weights):
-                    weight_tensor = weight.value() if hasattr(weight, 'value') and callable(weight.value) else weight
-                    weights_param_tensor = weights.value() if hasattr(weights, 'value') and callable(weights.value) else weights
-                    if backend.convert_to_numpy(ops.mean(ops.abs(weight_tensor - weights_param_tensor))) < 1e-6:
+                if ops.shape(weight) == ops.shape(weights_tensor):
+                    weight_tensor_val = weight.value() if hasattr(weight, 'value') and callable(weight.value) else weight
+                    if backend.convert_to_numpy(ops.mean(ops.abs(weight_tensor_val - weights_tensor))) < 1e-6:
                         target_gradients = all_gradients[i]
                         break
             
             if target_gradients is None:
-                 raise ValueError(f"Could not find gradients for weight tensor with shape {ops.shape(weights)} in TensorFlow backend.")
+                 raise ValueError(f"Could not find gradients for weight tensor with shape {ops.shape(weights_tensor)} in TensorFlow backend.")
             gradients = target_gradients
 
         elif backend_name == "jax":
             import jax
             
             def get_loss(weight_values):
-                original_weights = [w.value for w in trainable_weights]
+                original_weights = [w.value() for w in trainable_weights]
                 for var, new_w in zip(trainable_weights, weight_values):
                     var.assign(new_w)
                 
@@ -479,20 +475,19 @@ class SaliencyPruning(PruningMethod):
                     
                 return ops.mean(loss) if len(ops.shape(loss)) > 0 else loss
             
-            current_weights = [w.value for w in trainable_weights]
+            current_weights = [w.value() for w in trainable_weights]
             all_gradients = jax.grad(get_loss)(current_weights)
             
             target_gradients = None
             for i, weight_var in enumerate(trainable_weights):
-                if ops.shape(weight_var) == ops.shape(weights):
-                    weight_tensor = weight_var.value if hasattr(weight_var, 'value') else weight_var
-                    weights_param_tensor = weights.value if hasattr(weights, 'value') else weights
-                    if ops.mean(ops.abs(weight_tensor - weights_param_tensor)) < 1e-6:
+                if ops.shape(weight_var) == ops.shape(weights_tensor):
+                    weight_tensor_val = weight_var.value() if hasattr(weight_var, 'value') and callable(weight_var.value) else weight_var
+                    if ops.mean(ops.abs(weight_tensor_val - weights_tensor)) < 1e-6:
                         target_gradients = all_gradients[i]
                         break
             
             if target_gradients is None:
-                raise ValueError(f"Could not find gradients for weight tensor with shape {ops.shape(weights)} in JAX backend.")
+                raise ValueError(f"Could not find gradients for weight tensor with shape {ops.shape(weights_tensor)} in JAX backend.")
             gradients = target_gradients
 
         elif backend_name == "torch":
@@ -500,7 +495,7 @@ class SaliencyPruning(PruningMethod):
             
             torch_weights = []
             for var in trainable_weights:
-                tensor = var.value if hasattr(var, 'value') else var
+                tensor = var.value() if hasattr(var, 'value') and callable(var.value) else var
                 if hasattr(tensor, 'requires_grad') and not tensor.requires_grad:
                     tensor.requires_grad_(True)
                 torch_weights.append(tensor)
@@ -519,26 +514,22 @@ class SaliencyPruning(PruningMethod):
             
             target_gradients = None
             for i, weight_var in enumerate(trainable_weights):
-                if ops.shape(weight_var) == ops.shape(weights) and all_gradients[i] is not None:
-                    weight_tensor = weight_var.value if hasattr(weight_var, 'value') else weight_var
-                    weights_param_tensor = weights.value if hasattr(weights, 'value') else weights
-                    if ops.mean(ops.abs(weight_tensor - weights_param_tensor)) < 1e-6:
+                if ops.shape(weight_var) == ops.shape(weights_tensor) and all_gradients[i] is not None:
+                    weight_tensor_val = weight_var.value() if hasattr(weight_var, 'value') and callable(weight_var.value) else weight_var
+                    if ops.mean(ops.abs(weight_tensor_val - weights_tensor)) < 1e-6:
                         target_gradients = all_gradients[i]
                         break
             
             if target_gradients is None:
-                raise ValueError(f"Could not find gradients for weight tensor with shape {ops.shape(weights)} in PyTorch backend.")
+                raise ValueError(f"Could not find gradients for weight tensor with shape {ops.shape(weights_tensor)} in PyTorch backend.")
             gradients = target_gradients
                 
         else:
             raise ValueError(f"SaliencyPruning is not supported for backend '{backend_name}'.")
         
-        if hasattr(gradients, 'value'):
-            gradients = gradients.value
+        gradients_val = gradients.value() if hasattr(gradients, 'value') and callable(gradients.value) else gradients
             
-        weights_tensor = weights.value() if hasattr(weights, 'value') and callable(weights.value) else weights
-            
-        saliency_scores = ops.abs(gradients * weights_tensor)
+        saliency_scores = ops.abs(gradients_val * weights_tensor)
         
         return saliency_scores
 
@@ -680,8 +671,8 @@ class TaylorPruning(PruningMethod):
                 return ops.mean(loss) if len(ops.shape(loss)) > 0 else loss
             
             # Compute first-order gradients
-            with tf.GradientTape(watch_accessed_variables=True) as tape:
-                # Explicitly watch the target weight variable
+            with tf.GradientTape(watch_accessed_variables=False) as tape:
+                # Explicitly watch the target weight variable's tensor value
                 watch_var = target_weight_var.value() if hasattr(target_weight_var, 'value') and callable(target_weight_var.value) else target_weight_var
                 tape.watch(watch_var)
                 
