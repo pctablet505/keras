@@ -708,7 +708,7 @@ class TaylorPruning(PruningMethod):
             
             def compute_loss_fn(weight_vals):
                 # Temporarily set weights
-                old_weights = target_layer.kernel.value
+                old_weights = target_layer.kernel.value()
                 target_layer.kernel.assign(weight_vals)
                 
                 predictions = model(x_data, training=False)
