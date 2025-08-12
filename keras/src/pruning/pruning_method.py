@@ -495,6 +495,12 @@ class SaliencyPruning(PruningMethod):
                            f"Use L1Pruning or other magnitude-based methods instead.")
         
         # Compute saliency scores: |gradient * weight|
+        # Ensure we use tensor values, not Variable objects
+        if hasattr(gradients, 'value'):
+            gradients = gradients.value
+        if hasattr(weights, 'value'):
+            weights = weights.value
+            
         saliency_scores = ops.abs(gradients * weights)
         
         return saliency_scores
@@ -777,6 +783,15 @@ class TaylorPruning(PruningMethod):
         # Note: This is a simplified Taylor approximation since computing true Hessian diagonal
         # is computationally expensive. The second-order term uses gradient magnitude as a proxy
         # for curvature, which is a common heuristic in pruning literature.
+        
+        # Ensure we use tensor values, not Variable objects
+        if hasattr(gradients, 'value'):
+            gradients = gradients.value
+        if hasattr(weights, 'value'):
+            weights = weights.value
+        if hasattr(hessian_diag_approx, 'value'):
+            hessian_diag_approx = hessian_diag_approx.value
+            
         first_order_term = ops.abs(gradients * weights)  # |∂L/∂w * w|
         second_order_term = 0.5 * ops.abs(hessian_diag_approx * ops.square(weights))  # Approximated second-order term
         
