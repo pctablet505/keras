@@ -682,12 +682,7 @@ class TaylorPruning(PruningMethod):
             # Compute first-order gradients
             with tf.GradientTape(watch_accessed_variables=True) as tape:
                 # Explicitly watch the target weight variable
-                if hasattr(target_weight_var, 'value'):
-                    # Keras Variable - watch the underlying tensor
-                    watch_var = target_weight_var.value()
-                else:
-                    # Already a TensorFlow tensor/variable
-                    watch_var = target_weight_var
+                watch_var = target_weight_var.value() if hasattr(target_weight_var, 'value') and callable(target_weight_var.value) else target_weight_var
                 tape.watch(watch_var)
                 
                 loss = compute_loss()
@@ -709,8 +704,8 @@ class TaylorPruning(PruningMethod):
             
             def compute_loss_fn(weight_vals):
                 # Temporarily set weights
-                old_weights = target_layer.kernel.value()
-                target_layer.kernel.assign(weight_vals)
+                old_weights = target_weight_var.value()
+                target_weight_var.assign(weight_vals)
                 
                 predictions = model(x_data, training=False)
                 if callable(loss_fn):
@@ -722,7 +717,7 @@ class TaylorPruning(PruningMethod):
                 loss_scalar = ops.mean(loss) if len(ops.shape(loss)) > 0 else loss
                 
                 # Restore weights
-                target_layer.kernel.assign(old_weights)
+                target_weight_var.assign(old_weights)
                 return loss_scalar
             
             # Compute gradients using JAX
@@ -738,10 +733,7 @@ class TaylorPruning(PruningMethod):
             import torch
             
             # For Keras variables, get the underlying tensor
-            if hasattr(target_weight_var, 'value'):
-                torch_var = target_weight_var.value()
-            else:
-                torch_var = target_weight_var
+            torch_var = target_weight_var.value() if hasattr(target_weight_var, 'value') and callable(target_weight_var.value) else target_weight_var
                 
             # Set requires_grad for the target weights
             torch_var.requires_grad_(True)
@@ -770,8 +762,8 @@ class TaylorPruning(PruningMethod):
             epsilon = 1e-7
             
             def compute_loss_with_weights(layer_weights):
-                old_weights = target_layer.kernel.value()
-                target_layer.kernel.assign(layer_weights)
+                old_weights = target_weight_var.value()
+                target_weight_var.assign(layer_weights)
                 
                 predictions = model(x_data, training=False)
                 if callable(loss_fn):
@@ -781,7 +773,7 @@ class TaylorPruning(PruningMethod):
                     loss = loss_obj(y_data, predictions)
                 
                 loss_scalar = ops.mean(loss) if len(ops.shape(loss)) > 0 else loss
-                target_layer.kernel.assign(old_weights)
+                target_weight_var.assign(old_weights)
                 return loss_scalar
             
             # Numerical gradient computation
