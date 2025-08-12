@@ -421,16 +421,12 @@ class SaliencyPruning(PruningMethod):
         from keras.src import backend as keras_backend
         backend_name = keras_backend.backend()
         
+        trainable_weights = [v for v in model.trainable_variables if len(v.shape) > 1]
+
         if backend_name == "tensorflow":
-            # Use TensorFlow's GradientTape for automatic differentiation
             import tensorflow as tf
             
-            # Find all trainable weights to compute gradients for all at once
-            # Use model.trainable_variables to get all trainable weights including nested layers
-            trainable_weights = [var for var in model.trainable_variables if hasattr(var, 'shape') and len(var.shape) > 1]
-            
             def compute_loss():
-                # Keep model in inference mode but ensure gradient flow
                 predictions = model(x_data, training=False)
                 if callable(loss_fn):
                     loss = loss_fn(y_data, predictions)
@@ -439,96 +435,108 @@ class SaliencyPruning(PruningMethod):
                     loss = loss_obj(y_data, predictions)
                 return ops.mean(loss) if len(ops.shape(loss)) > 0 else loss
             
-            # Use tf.GradientTape with watch_accessed_variables=True to automatically track all variables
-            with tf.GradientTape(watch_accessed_variables=True, persistent=False) as tape:
-                # Explicitly watch all trainable variables to ensure they're tracked
+            with tf.GradientTape(watch_accessed_variables=True) as tape:
                 for var in model.trainable_variables:
-                    # Extract tensor value if it's a Keras Variable
                     if hasattr(var, 'value'):
                         tape.watch(var.value)
                     else:
                         tape.watch(var)
-                
                 loss = compute_loss()
             
-            # Get gradients for all trainable variables
-            # Need to get the actual tensor values (not Variables) for gradient computation
-            watch_vars = []
-            for var in trainable_weights:
-                if hasattr(var, 'value'):
-                    watch_vars.append(var.value)
-                else:
-                    watch_vars.append(var)
-            
+            watch_vars = [v.value if hasattr(v, 'value') else v for v in trainable_weights]
             all_gradients = tape.gradient(loss, watch_vars)
             
-            # Find the gradient for our specific weight tensor
             target_gradients = None
             for i, weight in enumerate(trainable_weights):
                 if ops.shape(weight) == ops.shape(weights):
-                    # Check if values are close (handles case where multiple layers have same shape)
-                    try:
-                        # Extract tensor values for comparison to avoid Variable type issues
-                        weight_tensor = weight.value() if hasattr(weight, 'value') and callable(weight.value) else weight
-                        weights_param_tensor = weights.value() if hasattr(weights, 'value') and callable(weights.value) else weights
-                        weight_diff = ops.mean(ops.abs(weight_tensor - weights_param_tensor))
-                        if backend.convert_to_numpy(weight_diff) < 1e-6:
-                            target_gradients = all_gradients[i]
-                            break
-                    except:
-                        # If comparison fails, still check if gradient exists and shapes match
-                        if all_gradients[i] is not None:
-                            target_gradients = all_gradients[i]
-                            break
-                        
-            if target_gradients is None:
-                # Fallback: try to find ANY gradient with matching shape, even if values don't match exactly
-                for i, weight in enumerate(trainable_weights):
-                    if (ops.shape(weight) == ops.shape(weights) and 
-                        all_gradients[i] is not None):
+                    weight_tensor = weight.value() if hasattr(weight, 'value') and callable(weight.value) else weight
+                    weights_param_tensor = weights.value() if hasattr(weights, 'value') and callable(weights.value) else weights
+                    if backend.convert_to_numpy(ops.mean(ops.abs(weight_tensor - weights_param_tensor))) < 1e-6:
                         target_gradients = all_gradients[i]
                         break
-                
+            
             if target_gradients is None:
-                # Enhanced error message with debugging info
-                available_shapes = [tuple(ops.shape(w).numpy() if hasattr(ops.shape(w), 'numpy') else ops.shape(w)) for w in trainable_weights]
-                gradient_status = [(ops.shape(w), all_gradients[i] is not None) for i, w in enumerate(trainable_weights)]
+                 raise ValueError(f"Could not find gradients for weight tensor with shape {ops.shape(weights)} in TensorFlow backend.")
+            gradients = target_gradients
+
+        elif backend_name == "jax":
+            import jax
+            
+            def get_loss(weight_values):
+                original_weights = [w.value for w in trainable_weights]
+                for var, new_w in zip(trainable_weights, weight_values):
+                    var.assign(new_w)
                 
-                raise ValueError(f"Could not find gradients for weight tensor with shape {ops.shape(weights)}. "
-                               f"Available trainable weight shapes: {available_shapes}. "
-                               f"Gradient status (shape, has_gradient): {gradient_status}. "
-                               f"Make sure model is compiled and all weights are reachable from loss.")
+                predictions = model(x_data, training=False)
+                if callable(loss_fn):
+                    loss = loss_fn(y_data, predictions)
+                else:
+                    loss_obj = keras.losses.get(loss_fn)
+                    loss = loss_obj(y_data, predictions)
                 
+                for var, old_w in zip(trainable_weights, original_weights):
+                    var.assign(old_w)
+                    
+                return ops.mean(loss) if len(ops.shape(loss)) > 0 else loss
+            
+            current_weights = [w.value for w in trainable_weights]
+            all_gradients = jax.grad(get_loss)(current_weights)
+            
+            target_gradients = None
+            for i, weight_var in enumerate(trainable_weights):
+                if ops.shape(weight_var) == ops.shape(weights):
+                    weight_tensor = weight_var.value if hasattr(weight_var, 'value') else weight_var
+                    weights_param_tensor = weights.value if hasattr(weights, 'value') else weights
+                    if ops.mean(ops.abs(weight_tensor - weights_param_tensor)) < 1e-6:
+                        target_gradients = all_gradients[i]
+                        break
+            
+            if target_gradients is None:
+                raise ValueError(f"Could not find gradients for weight tensor with shape {ops.shape(weights)} in JAX backend.")
+            gradients = target_gradients
+
+        elif backend_name == "torch":
+            import torch
+            
+            torch_weights = []
+            for var in trainable_weights:
+                tensor = var.value if hasattr(var, 'value') else var
+                if hasattr(tensor, 'requires_grad') and not tensor.requires_grad:
+                    tensor.requires_grad_(True)
+                torch_weights.append(tensor)
+
+            def compute_loss():
+                predictions = model(x_data, training=False)
+                if callable(loss_fn):
+                    loss = loss_fn(y_data, predictions)
+                else:
+                    loss_obj = keras.losses.get(loss_fn)
+                    loss = loss_obj(y_data, predictions)
+                return ops.mean(loss) if len(ops.shape(loss)) > 0 else loss
+            
+            loss = compute_loss()
+            all_gradients = torch.autograd.grad(loss, torch_weights, allow_unused=True)
+            
+            target_gradients = None
+            for i, weight_var in enumerate(trainable_weights):
+                if ops.shape(weight_var) == ops.shape(weights) and all_gradients[i] is not None:
+                    weight_tensor = weight_var.value if hasattr(weight_var, 'value') else weight_var
+                    weights_param_tensor = weights.value if hasattr(weights, 'value') else weights
+                    if ops.mean(ops.abs(weight_tensor - weights_param_tensor)) < 1e-6:
+                        target_gradients = all_gradients[i]
+                        break
+            
+            if target_gradients is None:
+                raise ValueError(f"Could not find gradients for weight tensor with shape {ops.shape(weights)} in PyTorch backend.")
             gradients = target_gradients
                 
-        elif backend_name == "jax":
-            raise ValueError("SaliencyPruning with JAX backend is not yet implemented. "
-                           "Use TensorFlow backend or magnitude-based pruning methods like L1Pruning.")
-            
-        elif backend_name == "torch":
-            raise ValueError("SaliencyPruning with PyTorch backend is not yet implemented. "
-                           "Use TensorFlow backend or magnitude-based pruning methods like L1Pruning.")
-                
         else:
-            # No fallback - saliency pruning requires proper gradient computation
-            raise ValueError(f"SaliencyPruning is not supported for backend '{backend_name}'. "
-                           f"Currently only TensorFlow backend is supported. "
-                           f"Use L1Pruning or other magnitude-based methods instead.")
+            raise ValueError(f"SaliencyPruning is not supported for backend '{backend_name}'.")
         
-        # Compute saliency scores: |gradient * weight|
-        # Ensure we use tensor values, not Variable objects
-        # Handle TensorFlow Variable extraction properly
-        import tensorflow as tf
-        
-        # For gradients (already extracted from tape)
         if hasattr(gradients, 'value'):
             gradients = gradients.value
             
-        # For weights - use the same tensor we used for comparison
-        if hasattr(weights, 'value') and callable(weights.value):
-            weights_tensor = weights.value()
-        else:
-            weights_tensor = weights
+        weights_tensor = weights.value() if hasattr(weights, 'value') and callable(weights.value) else weights
             
         saliency_scores = ops.abs(gradients * weights_tensor)
         
@@ -549,13 +557,15 @@ class TaylorPruning(PruningMethod):
     def compute_mask(self, weights, sparsity_ratio, **kwargs):
         """Compute Taylor expansion based mask."""
         # Ensure we work with tensor values, not Variable objects
-        if hasattr(weights, 'value'):
-            weights = weights.value
+        if hasattr(weights, 'value') and callable(weights.value):
+            weights_tensor = weights.value()
+        else:
+            weights_tensor = weights
             
         if sparsity_ratio <= 0:
-            return ops.ones_like(weights, dtype="bool")
+            return ops.ones_like(weights_tensor, dtype="bool")
         if sparsity_ratio >= 1:
-            return ops.zeros_like(weights, dtype="bool")
+            return ops.zeros_like(weights_tensor, dtype="bool")
 
         # Get model and data from kwargs (passed by core.py)
         model = kwargs.get('model')
@@ -572,7 +582,7 @@ class TaylorPruning(PruningMethod):
         total_size = int(backend.convert_to_numpy(ops.size(flat_scores)))
         k = int(sparsity_ratio * total_size)
         if k == 0:
-            return ops.ones_like(weights, dtype="bool")
+            return ops.ones_like(weights_tensor, dtype="bool")
 
         sorted_scores = ops.sort(flat_scores)
         threshold = sorted_scores[k]
@@ -686,15 +696,11 @@ class TaylorPruning(PruningMethod):
             if gradients is None:
                 raise ValueError(f"No gradients computed for layer {target_layer.name}")
             
-            # For second-order term, we need proper Hessian diagonal computation
-            # This is computationally expensive, so we use a simpler first-order approximation
-            # In practice, most Taylor pruning methods fall back to first-order due to Hessian cost
-            # We'll use the Optimal Brain Damage (OBD) approximation: assume Hessian is identity-scaled
-            # This gives us: ∂²L/∂w² ≈ constant (typically estimated from gradients)
-            
-            # Simple approximation: use gradient magnitude as proxy for curvature
-            # This is a common heuristic in pruning literature when full Hessian is too expensive
-            hessian_diag_approx = ops.abs(gradients) + 1e-8
+            # For second-order term, we use the square of the gradient as an
+            # approximation of the Hessian diagonal, as suggested in Optimal
+            # Brain Damage paper. This is more stable than using the gradient
+            # magnitude and is a common practice.
+            hessian_diag_approx = ops.square(gradients) + 1e-8
             
         elif backend_name == "jax":
             # Use JAX's automatic differentiation
