@@ -370,8 +370,11 @@ class SaliencyPruning(PruningMethod):
         # Validate requirements and get loss_fn (may return model.loss if not provided)
         loss_fn = _validate_gradient_method_requirements("SaliencyPruning", model, dataset, loss_fn)
 
+        # Get pruning_batch_size from kwargs (with default)
+        pruning_batch_size = kwargs.get('pruning_batch_size', 64)
+        
         # Compute saliency scores (|weight * gradient|)
-        saliency_scores = self._compute_saliency_scores(weights, model, loss_fn, dataset) # Pass original weights
+        saliency_scores = self._compute_saliency_scores(weights, model, loss_fn, dataset, pruning_batch_size) # Pass original weights
 
         flat_scores = ops.reshape(saliency_scores, [-1])
         total_size = int(backend.convert_to_numpy(ops.size(flat_scores)))
@@ -385,13 +388,14 @@ class SaliencyPruning(PruningMethod):
         mask = saliency_scores > threshold
         return mask
 
-    def _compute_saliency_scores(self, weights, model, loss_fn, dataset):
+    def _compute_saliency_scores(self, weights, model, loss_fn, dataset, pruning_batch_size=64):
         """Compute saliency scores using gradients.
         
-        Fully vectorized version that processes all samples in a single GPU operation.
+        Memory-efficient version that processes the entire dataset in configurable batches.
         """
         import keras
         import numpy as np
+        from tqdm import tqdm
         
         # Extract input and target data from dataset
         if isinstance(dataset, tuple) and len(dataset) == 2:
@@ -399,16 +403,15 @@ class SaliencyPruning(PruningMethod):
         else:
             raise ValueError("Dataset must be a tuple (x_data, y_data) for saliency computation.")
         
-        # Use sample-based approach for efficiency but process all at once
+        # Use the ENTIRE dataset for better gradient estimates
         total_samples = x_data.shape[0] if hasattr(x_data, 'shape') else len(x_data)
-        sample_size = min(1000, total_samples)
         
-        # Random sampling for efficiency
-        sample_indices = np.random.choice(total_samples, size=sample_size, replace=False)
+        # Calculate number of batches needed
+        num_batches = (total_samples + pruning_batch_size - 1) // pruning_batch_size
         
-        # Convert ENTIRE sample to tensors ONCE - full vectorization
-        x_sample_tensor = ops.convert_to_tensor(x_data[sample_indices])
-        y_sample_tensor = ops.convert_to_tensor(y_data[sample_indices])
+        # Shuffle indices for better representation
+        indices = np.arange(total_samples)
+        np.random.shuffle(indices)
         
         # Use backend-specific gradient computation
         from keras.src import backend as keras_backend
@@ -429,68 +432,109 @@ class SaliencyPruning(PruningMethod):
         if target_weight_var is None:
             raise ValueError(f"Could not find target weight variable with shape {ops.shape(weights_tensor)}.")
 
-        # Single vectorized gradient computation - NO LOOPS!
-        if backend_name == "tensorflow":
-            import tensorflow as tf
+        # Initialize accumulated gradients
+        accumulated_gradients = None
+        total_batches_processed = 0
+
+        # Process data in batches with progress bar
+        progress_bar = tqdm(range(num_batches), desc="Computing saliency gradients", unit="batch")
+        for batch_idx in progress_bar:
+            start_idx = batch_idx * pruning_batch_size
+            end_idx = min(start_idx + pruning_batch_size, total_samples)
             
-            with tf.GradientTape() as tape:
-                tape.watch(target_weight_var)
-                predictions = model(x_sample_tensor, training=False)
+            if start_idx >= end_idx:
+                break
+                
+            batch_indices = indices[start_idx:end_idx]
+            # Convert current batch to tensors
+            batch_x = ops.convert_to_tensor(x_data[batch_indices])
+            batch_y = ops.convert_to_tensor(y_data[batch_indices])
+
+            # Vectorized gradient computation for current batch
+            if backend_name == "tensorflow":
+                import tensorflow as tf
+                
+                with tf.GradientTape() as tape:
+                    # Watch the actual TensorFlow variable, not the Keras Variable wrapper
+                    tf_var = target_weight_var._value if hasattr(target_weight_var, '_value') else target_weight_var
+                    tape.watch(tf_var)
+                    predictions = model(batch_x, training=False)
+                    if callable(loss_fn):
+                        loss_val = loss_fn(batch_y, predictions)
+                    else:
+                        loss_obj = keras.losses.get(loss_fn)
+                        loss_val = loss_obj(batch_y, predictions)
+                    # Ensure loss is scalar
+                    loss = ops.mean(loss_val) if len(ops.shape(loss_val)) > 0 else loss_val
+                
+                batch_gradients = tape.gradient(loss, tf_var)
+                
+            elif backend_name == "jax":
+                import jax
+                
+                def loss_fn_for_grad(weight_vals):
+                    old_weights = target_weight_var.value() if hasattr(target_weight_var, 'value') and callable(target_weight_var.value) else target_weight_var.value if hasattr(target_weight_var, 'value') else target_weight_var
+                    target_weight_var.assign(weight_vals)
+                    
+                    predictions = model(batch_x, training=False)
+                    if callable(loss_fn):
+                        loss_val = loss_fn(batch_y, predictions)
+                    else:
+                        loss_obj = keras.losses.get(loss_fn)
+                        loss_val = loss_obj(batch_y, predictions)
+                    
+                    target_weight_var.assign(old_weights)
+                    return ops.mean(loss_val) if len(ops.shape(loss_val)) > 0 else loss_val
+                
+                weights_val = target_weight_var.value() if hasattr(target_weight_var, 'value') and callable(target_weight_var.value) else target_weight_var
+                batch_gradients = jax.grad(loss_fn_for_grad)(weights_val)
+
+            elif backend_name == "torch":
+                import torch
+                
+                target_var = target_weight_var.value() if hasattr(target_weight_var, 'value') and callable(target_weight_var.value) else target_weight_var.value if hasattr(target_weight_var, 'value') else target_weight_var
+                if hasattr(target_var, 'requires_grad') and not target_var.requires_grad:
+                    target_var.requires_grad_(True)
+
+                predictions = model(batch_x, training=False)
                 if callable(loss_fn):
-                    loss_val = loss_fn(y_sample_tensor, predictions)
+                    loss_val = loss_fn(batch_y, predictions)
                 else:
                     loss_obj = keras.losses.get(loss_fn)
-                    loss_val = loss_obj(y_sample_tensor, predictions)
-                # Ensure loss is scalar
+                    loss_val = loss_obj(batch_y, predictions)
                 loss = ops.mean(loss_val) if len(ops.shape(loss_val)) > 0 else loss_val
-            
-            gradients = tape.gradient(loss, target_weight_var)
-            
-        elif backend_name == "jax":
-            import jax
-            
-            def loss_fn_for_grad(weight_vals):
-                old_weights = target_weight_var.value() if hasattr(target_weight_var, 'value') and callable(target_weight_var.value) else target_weight_var.value if hasattr(target_weight_var, 'value') else target_weight_var
-                target_weight_var.assign(weight_vals)
                 
-                predictions = model(x_sample_tensor, training=False)
-                if callable(loss_fn):
-                    loss_val = loss_fn(y_sample_tensor, predictions)
-                else:
-                    loss_obj = keras.losses.get(loss_fn)
-                    loss_val = loss_obj(y_sample_tensor, predictions)
-                
-                target_weight_var.assign(old_weights)
-                return ops.mean(loss_val) if len(ops.shape(loss_val)) > 0 else loss_val
-            
-            weights_val = target_weight_var.value() if hasattr(target_weight_var, 'value') and callable(target_weight_var.value) else target_weight_var
-            gradients = jax.grad(loss_fn_for_grad)(weights_val)
-
-        elif backend_name == "torch":
-            import torch
-            
-            target_var = target_weight_var.value() if hasattr(target_weight_var, 'value') and callable(target_weight_var.value) else target_weight_var.value if hasattr(target_weight_var, 'value') else target_weight_var
-            if hasattr(target_var, 'requires_grad') and not target_var.requires_grad:
-                target_var.requires_grad_(True)
-
-            predictions = model(x_sample_tensor, training=False)
-            if callable(loss_fn):
-                loss_val = loss_fn(y_sample_tensor, predictions)
+                batch_gradients = torch.autograd.grad(loss, target_var)[0]
+                    
             else:
-                loss_obj = keras.losses.get(loss_fn)
-                loss_val = loss_obj(y_sample_tensor, predictions)
-            loss = ops.mean(loss_val) if len(ops.shape(loss_val)) > 0 else loss_val
-            
-            gradients = torch.autograd.grad(loss, target_var)[0]
-                
-        else:
-            raise ValueError(f"SaliencyPruning is not supported for backend '{backend_name}'.")
+                raise ValueError(f"SaliencyPruning is not supported for backend '{backend_name}'.")
 
-        if gradients is None:
+            if batch_gradients is None:
+                continue
+
+            # Accumulate gradients
+            batch_gradients_val = batch_gradients.value() if hasattr(batch_gradients, 'value') and callable(batch_gradients.value) else batch_gradients
+            
+            if accumulated_gradients is None:
+                accumulated_gradients = batch_gradients_val
+            else:
+                accumulated_gradients = accumulated_gradients + batch_gradients_val
+            
+            total_batches_processed += 1
+            
+            # Update progress bar
+            progress_bar.set_postfix({
+                'samples': f"{end_idx}/{total_samples}",
+                'batches': f"{total_batches_processed}/{num_batches}"
+            })
+
+        progress_bar.close()
+
+        if accumulated_gradients is None or total_batches_processed == 0:
             raise ValueError(f"Could not compute gradients for weight tensor with shape {ops.shape(weights_tensor)}.")
         
-        # Extract gradient values if needed
-        gradients_val = gradients.value() if hasattr(gradients, 'value') and callable(gradients.value) else gradients
+        # Average the accumulated gradients
+        gradients_val = accumulated_gradients / total_batches_processed
         
         saliency_scores = ops.abs(gradients_val * weights_tensor)
         
@@ -540,8 +584,11 @@ class TaylorPruning(PruningMethod):
         # Validate requirements and get loss_fn (may return model.loss if not provided)
         loss_fn = _validate_gradient_method_requirements("TaylorPruning", model, dataset, loss_fn)
 
+        # Get pruning_batch_size from kwargs (with default)
+        pruning_batch_size = kwargs.get('pruning_batch_size', 64)
+        
         # Compute Taylor scores
-        taylor_scores = self._compute_taylor_scores(weights, model, loss_fn, dataset)
+        taylor_scores = self._compute_taylor_scores(weights, model, loss_fn, dataset, pruning_batch_size)
 
         flat_scores = ops.reshape(taylor_scores, [-1])
         total_size = int(backend.convert_to_numpy(ops.size(flat_scores)))
@@ -555,13 +602,14 @@ class TaylorPruning(PruningMethod):
         mask = taylor_scores > threshold
         return mask
 
-    def _compute_taylor_scores(self, weights, model, loss_fn, dataset):
+    def _compute_taylor_scores(self, weights, model, loss_fn, dataset, pruning_batch_size=64):
         """Compute second-order Taylor expansion scores.
         
-        Fully vectorized version that processes all samples in a single GPU operation.
+        Memory-efficient version that processes the entire dataset in configurable batches.
         """
         import keras
         import numpy as np
+        from tqdm import tqdm
         
         # Extract input and target data from dataset
         if isinstance(dataset, tuple) and len(dataset) == 2:
@@ -569,16 +617,15 @@ class TaylorPruning(PruningMethod):
         else:
             raise ValueError("Dataset must be a tuple (x_data, y_data) for Taylor computation.")
         
-        # Use sample-based approach for efficiency but process all at once
+        # Use the ENTIRE dataset for better gradient estimates
         total_samples = x_data.shape[0] if hasattr(x_data, 'shape') else len(x_data)
-        sample_size = min(1000, total_samples)
         
-        # Random sampling for efficiency
-        sample_indices = np.random.choice(total_samples, size=sample_size, replace=False)
+        # Calculate number of batches needed
+        num_batches = (total_samples + pruning_batch_size - 1) // pruning_batch_size
         
-        # Convert ENTIRE sample to tensors ONCE - full vectorization
-        x_sample_tensor = ops.convert_to_tensor(x_data[sample_indices])
-        y_sample_tensor = ops.convert_to_tensor(y_data[sample_indices])
+        # Shuffle indices for better representation
+        indices = np.arange(total_samples)
+        np.random.shuffle(indices)
         
         # Extract tensor values to ensure we work with tensors, not Variables
         weights_tensor_val = weights.value() if hasattr(weights, 'value') and callable(weights.value) else weights
@@ -601,103 +648,135 @@ class TaylorPruning(PruningMethod):
         if target_weight_var is None:
             raise ValueError(f"Could not find weight variable with shape {ops.shape(weights_tensor_val)}")
         
-        # Backend-specific gradient computation - single vectorized operation
+        # Backend-specific gradient computation
         from keras.src import backend as keras_backend
         backend_name = keras_backend.backend()
+        
+        # Initialize accumulated gradients and squared gradients
+        accumulated_gradients = None
+        accumulated_squared_gradients = None
+        total_batches_processed = 0
 
-        if backend_name == "tensorflow":
-            import tensorflow as tf
+        # Process data in batches with progress bar
+        progress_bar = tqdm(range(num_batches), desc="Computing Taylor gradients", unit="batch")
+        for batch_idx in progress_bar:
+            start_idx = batch_idx * pruning_batch_size
+            end_idx = min(start_idx + pruning_batch_size, total_samples)
             
-            # Single vectorized computation for both first and second order terms
-            with tf.GradientTape(persistent=True) as tape:
-                tape.watch(target_weight_var)
-                predictions = model(x_sample_tensor, training=False)
+            if start_idx >= end_idx:
+                break
+                
+            batch_indices = indices[start_idx:end_idx]
+            # Convert current batch to tensors
+            batch_x = ops.convert_to_tensor(x_data[batch_indices])
+            batch_y = ops.convert_to_tensor(y_data[batch_indices])
+
+            if backend_name == "tensorflow":
+                import tensorflow as tf
+                
+                # Use persistent tape for Fisher approximation
+                with tf.GradientTape(persistent=True) as tape:
+                    # Watch the actual TensorFlow variable, not the Keras Variable wrapper
+                    tf_var = target_weight_var._value if hasattr(target_weight_var, '_value') else target_weight_var
+                    tape.watch(tf_var)
+                    predictions = model(batch_x, training=False)
+                    if callable(loss_fn):
+                        per_sample_loss = loss_fn(batch_y, predictions)
+                    else:
+                        loss_obj = keras.losses.get(loss_fn)
+                        per_sample_loss = loss_obj(batch_y, predictions)
+                    
+                    # Total loss for first-order term
+                    total_loss = ops.mean(per_sample_loss)
+                
+                # First-order gradient (average gradient)
+                batch_avg_gradients = tape.gradient(total_loss, tf_var)
+                
+                # Second-order term via Fisher Information
+                if self.use_fisher_approximation and batch_avg_gradients is not None:
+                    # For memory efficiency, use squared gradient approximation instead of per-sample gradients
+                    batch_squared_gradients = ops.square(batch_avg_gradients)
+                else:
+                    batch_squared_gradients = ops.square(batch_avg_gradients) if batch_avg_gradients is not None else None
+                
+                del tape  # Clean up persistent tape
+                
+            elif backend_name == "jax":
+                import jax
+                
+                def loss_fn_for_grad(weight_vals):
+                    old_weights = target_weight_var.value() if hasattr(target_weight_var, 'value') and callable(target_weight_var.value) else target_weight_var.value if hasattr(target_weight_var, 'value') else target_weight_var
+                    target_weight_var.assign(weight_vals)
+                    
+                    predictions = model(batch_x, training=False)
+                    if callable(loss_fn):
+                        loss_val = loss_fn(batch_y, predictions)
+                    else:
+                        loss_obj = keras.losses.get(loss_fn)
+                        loss_val = loss_obj(batch_y, predictions)
+                    
+                    target_weight_var.assign(old_weights)
+                    return ops.mean(loss_val) if len(ops.shape(loss_val)) > 0 else loss_val
+                
+                weights_val = target_weight_var.value() if hasattr(target_weight_var, 'value') and callable(target_weight_var.value) else target_weight_var.value if hasattr(target_weight_var, 'value') else target_weight_var
+                batch_avg_gradients = jax.grad(loss_fn_for_grad)(weights_val)
+                
+                # For JAX, use simpler approximation for second-order term
+                batch_squared_gradients = ops.square(batch_avg_gradients)
+                    
+            elif backend_name == "torch":
+                import torch
+                
+                target_var = target_weight_var.value() if hasattr(target_weight_var, 'value') and callable(target_weight_var.value) else target_weight_var.value if hasattr(target_weight_var, 'value') else target_weight_var
+                if hasattr(target_var, 'requires_grad'):
+                    target_var.requires_grad_(True)
+                
+                predictions = model(batch_x, training=False)
                 if callable(loss_fn):
-                    per_sample_loss = loss_fn(y_sample_tensor, predictions)
+                    per_sample_loss = loss_fn(batch_y, predictions)
                 else:
                     loss_obj = keras.losses.get(loss_fn)
-                    per_sample_loss = loss_obj(y_sample_tensor, predictions)
+                    per_sample_loss = loss_obj(batch_y, predictions)
                 
-                # Total loss for first-order term
                 total_loss = ops.mean(per_sample_loss)
-            
-            # First-order gradient (average gradient)
-            avg_gradients = tape.gradient(total_loss, target_weight_var)
-            
-            # Second-order term via Fisher Information (expectation of squared gradients)
-            if self.use_fisher_approximation:
-                # Compute per-sample gradients for Fisher approximation
-                # This is still more efficient than the loop-based approach
-                per_sample_gradients_list = []
-                for i in range(sample_size):
-                    sample_loss = per_sample_loss[i]
-                    sample_grad = tape.gradient(sample_loss, target_weight_var)
-                    if sample_grad is not None:
-                        per_sample_gradients_list.append(sample_grad)
+                batch_avg_gradients = torch.autograd.grad(total_loss, target_var, create_graph=False)[0]
                 
-                if per_sample_gradients_list:
-                    # Stack and compute mean of squared gradients
-                    per_sample_gradients = ops.stack(per_sample_gradients_list, axis=0)
-                    avg_squared_gradients = ops.mean(ops.square(per_sample_gradients), axis=0)
-                else:
-                    avg_squared_gradients = ops.square(avg_gradients)  # Fallback
+                # For PyTorch, use simpler approximation
+                batch_squared_gradients = ops.square(batch_avg_gradients)
+                    
             else:
-                avg_squared_gradients = ops.square(avg_gradients)
-            
-            del tape  # Clean up persistent tape
-                
-        elif backend_name == "jax":
-            import jax
-            
-            def loss_fn_for_grad(weight_vals):
-                old_weights = target_weight_var.value() if hasattr(target_weight_var, 'value') and callable(target_weight_var.value) else target_weight_var.value if hasattr(target_weight_var, 'value') else target_weight_var
-                target_weight_var.assign(weight_vals)
-                
-                predictions = model(x_sample_tensor, training=False)
-                if callable(loss_fn):
-                    loss_val = loss_fn(y_sample_tensor, predictions)
-                else:
-                    loss_obj = keras.losses.get(loss_fn)
-                    loss_val = loss_obj(y_sample_tensor, predictions)
-                
-                target_weight_var.assign(old_weights)
-                return ops.mean(loss_val) if len(ops.shape(loss_val)) > 0 else loss_val
-            
-            weights_val = target_weight_var.value() if hasattr(target_weight_var, 'value') and callable(target_weight_var.value) else target_weight_var.value if hasattr(target_weight_var, 'value') else target_weight_var
-            avg_gradients = jax.grad(loss_fn_for_grad)(weights_val)
-            
-            # For JAX, use simpler approximation for second-order term
-            avg_squared_gradients = ops.square(avg_gradients)
-                
-        elif backend_name == "torch":
-            import torch
-            
-            target_var = target_weight_var.value() if hasattr(target_weight_var, 'value') and callable(target_weight_var.value) else target_weight_var.value if hasattr(target_weight_var, 'value') else target_weight_var
-            if hasattr(target_var, 'requires_grad'):
-                target_var.requires_grad_(True)
-            
-            predictions = model(x_sample_tensor, training=False)
-            if callable(loss_fn):
-                per_sample_loss = loss_fn(y_sample_tensor, predictions)
-            else:
-                loss_obj = keras.losses.get(loss_fn)
-                per_sample_loss = loss_obj(y_sample_tensor, predictions)
-            
-            total_loss = ops.mean(per_sample_loss)
-            avg_gradients = torch.autograd.grad(total_loss, target_var, create_graph=True)[0]
-            
-            # For PyTorch, use simpler approximation
-            avg_squared_gradients = ops.square(avg_gradients)
-                
-        else:
-            raise ValueError(f"TaylorPruning not supported for backend '{backend_name}'.")
+                raise ValueError(f"TaylorPruning not supported for backend '{backend_name}'.")
 
-        if avg_gradients is None:
+            if batch_avg_gradients is None:
+                continue
+
+            # Accumulate gradients and squared gradients
+            batch_gradients_val = batch_avg_gradients.value() if hasattr(batch_avg_gradients, 'value') and callable(batch_avg_gradients.value) else batch_avg_gradients
+            batch_squared_gradients_val = batch_squared_gradients.value() if hasattr(batch_squared_gradients, 'value') and callable(batch_squared_gradients.value) else batch_squared_gradients
+            
+            if accumulated_gradients is None:
+                accumulated_gradients = batch_gradients_val
+                accumulated_squared_gradients = batch_squared_gradients_val
+            else:
+                accumulated_gradients = accumulated_gradients + batch_gradients_val
+                accumulated_squared_gradients = accumulated_squared_gradients + batch_squared_gradients_val
+            
+            total_batches_processed += 1
+            
+            # Update progress bar
+            progress_bar.set_postfix({
+                'samples': f"{end_idx}/{total_samples}",
+                'batches': f"{total_batches_processed}/{num_batches}"
+            })
+
+        progress_bar.close()
+
+        if accumulated_gradients is None or total_batches_processed == 0:
             raise ValueError(f"Could not compute gradients for weight tensor with shape {ops.shape(weights_tensor_val)}.")
         
-        # Extract gradient values if needed
-        avg_gradients_val = avg_gradients.value() if hasattr(avg_gradients, 'value') and callable(avg_gradients.value) else avg_gradients
-        avg_squared_gradients_val = avg_squared_gradients.value() if hasattr(avg_squared_gradients, 'value') and callable(avg_squared_gradients.value) else avg_squared_gradients
+        # Average the accumulated gradients
+        avg_gradients_val = accumulated_gradients / total_batches_processed
+        avg_squared_gradients_val = accumulated_squared_gradients / total_batches_processed
         
         # Compute Taylor score using corrected formula
         # First-order term: |∂L/∂w * w|
