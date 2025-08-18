@@ -36,20 +36,20 @@ def _get_tf_gradient_function(use_fisher):
                 accumulated_squared_gradients = [
                     tf.zeros_like(v) for v in trainable_variables
                 ]
-            total_samples = tf.constant(0.0)
+            num_batches = tf.constant(0.0)
 
             for batch_x, batch_y in tf_dataset:
                 with tf.GradientTape(persistent=True) as tape:
-                    predictions = model(batch_x, training=False)
+                    # Set model to training mode for meaningful gradients
+                    predictions = model(batch_x, training=True)
                     loss_val = loss_fn(batch_y, predictions)
                     loss = tf.reduce_mean(loss_val)
 
                 batch_gradients = tape.gradient(loss, trainable_variables)
-                batch_size = tf.cast(tf.shape(batch_x)[0], tf.float32)
 
                 for i, grad in enumerate(batch_gradients):
                     if grad is not None:
-                        accumulated_gradients[i] += grad * batch_size
+                        accumulated_gradients[i] += grad
 
                 if use_fisher:
                     # Fisher approximation using variance of gradients
@@ -65,28 +65,28 @@ def _get_tf_gradient_function(use_fisher):
                                 accumulated_squared_gradients[i] += (
                                     tf.square(batch_gradients[i])
                                     + 0.1 * tf.abs(grad)
-                                ) * batch_size
+                                )
                             elif batch_gradients[i] is not None:
                                 accumulated_squared_gradients[
                                     i
-                                ] += tf.square(batch_gradients[i]) * batch_size
+                                ] += tf.square(batch_gradients[i])
                     else:
                         for i, grad in enumerate(batch_gradients):
                             if grad is not None:
                                 accumulated_squared_gradients[i] += (
-                                    tf.square(grad) * batch_size
+                                    tf.square(grad)
                                 )
 
                 del tape
-                total_samples += batch_size
+                num_batches += 1.0
 
             averaged_gradients = [
-                g / total_samples if total_samples > 0 else g
+                g / num_batches if num_batches > 0 else g
                 for g in accumulated_gradients
             ]
             if use_fisher:
                 averaged_squared_gradients = [
-                    g / total_samples if total_samples > 0 else g
+                    g / num_batches if num_batches > 0 else g
                     for g in accumulated_squared_gradients
                 ]
                 return averaged_gradients, averaged_squared_gradients
@@ -139,6 +139,13 @@ class PruningMethod(abc.ABC):
     def _find_target_weight_variable(self, model, weights_tensor):
         """Find the target weight variable in the model that matches the given weights."""
         trainable_weights = model.trainable_variables
+        
+        # First try exact shape and identity matching
+        for weight in trainable_weights:
+            if weight is weights_tensor:
+                return weight
+                
+        # Then try shape and value matching
         for weight in trainable_weights:
             if ops.shape(weight) == ops.shape(weights_tensor):
                 weight_val = (
@@ -146,16 +153,20 @@ class PruningMethod(abc.ABC):
                     if hasattr(weight, "value") and callable(weight.value)
                     else weight
                 )
-                if (
-                    backend.convert_to_numpy(
-                        ops.mean(ops.abs(weight_val - weights_tensor))
-                    )
-                    < 1e-6
-                ):
+                # Use more lenient comparison
+                diff = backend.convert_to_numpy(
+                    ops.mean(ops.abs(weight_val - weights_tensor))
+                )
+                if diff < 1e-4:  # More lenient threshold
                     return weight
+                    
+        # Debug: Print shapes to help identify the issue
+        print(f"Target shape: {ops.shape(weights_tensor)}")
+        print(f"Available shapes: {[ops.shape(w) for w in trainable_weights]}")
+        
         raise ValueError(
-            "Could not find target weight variable with shape "
-            f"{ops.shape(weights_tensor)}."
+            f"Could not find target weight variable with shape "
+            f"{ops.shape(weights_tensor)} in {len(trainable_weights)} trainable variables."
         )
 
     def _compute_gradients_tf(self, variable, model, loss_fn, dataset):
@@ -181,6 +192,30 @@ class PruningMethod(abc.ABC):
             else:
                 loss_fn_for_graph = loss_fn
 
+            # Debug: Test gradient computation outside tf.function
+            print(f"Testing gradient computation...")
+            print(f"Model has {len(trainable_variables)} trainable variables")
+            print(f"Loss function: {loss_fn_for_graph}")
+            
+            # Quick test with a single batch
+            for batch_x, batch_y in tf_dataset.take(1):
+                print(f"Batch shapes: x={batch_x.shape}, y={batch_y.shape}")
+                with tf.GradientTape() as test_tape:
+                    test_pred = model(batch_x, training=True)
+                    print(f"Predictions shape: {test_pred.shape}")
+                    test_loss = loss_fn_for_graph(batch_y, test_pred)
+                    test_loss_mean = tf.reduce_mean(test_loss)
+                    print(f"Loss value: {float(test_loss_mean):.6f}")
+                
+                test_grads = test_tape.gradient(test_loss_mean, trainable_variables)
+                non_none_grads = [g for g in test_grads if g is not None]
+                if non_none_grads:
+                    first_grad_mean = tf.reduce_mean(tf.abs(non_none_grads[0]))
+                    print(f"First gradient mean: {float(first_grad_mean):.8f}")
+                else:
+                    print("All gradients are None!")
+                break
+
             gradient_fn = _get_tf_gradient_function(use_fisher=False)
             all_gradients, _ = gradient_fn(
                 trainable_variables, tf_dataset, model, loss_fn_for_graph
@@ -188,9 +223,12 @@ class PruningMethod(abc.ABC):
             self._all_gradients_cache[cache_key] = list(all_gradients)
 
         all_gradients = self._all_gradients_cache[cache_key]
-        try:
-            target_var_index = model.trainable_variables.index(variable)
-        except ValueError:
+        target_var_index = -1
+        for i, v in enumerate(model.trainable_variables):
+            if v is variable:
+                target_var_index = i
+                break
+        if target_var_index == -1:
             raise ValueError(
                 "Target variable not found in model's trainable variables."
             )
@@ -235,11 +273,12 @@ class PruningMethod(abc.ABC):
         all_gradients, all_squared_gradients = self._all_gradients_cache[
             cache_key
         ]
-        try:
-            target_var_index = model.trainable_variables.index(
-                target_weight_var
-            )
-        except ValueError:
+        target_var_index = -1
+        for i, v in enumerate(model.trainable_variables):
+            if v is target_weight_var:
+                target_var_index = i
+                break
+        if target_var_index == -1:
             raise ValueError(
                 "Target variable not found in model's trainable variables."
             )
@@ -360,17 +399,35 @@ class SaliencyPruning(PruningMethod):
             "SaliencyPruning", model, dataset, loss_fn
         )
         kwargs["loss_fn"] = loss_fn
+        
+        # Clear cache to avoid stale gradients
+        self._all_gradients_cache.clear()
+        
         saliency_scores = self.calculate_scores(weights_tensor, **kwargs)
 
         flat_scores = ops.reshape(saliency_scores, [-1])
-        total_size = int(backend.convert_to_numpy(ops.size(flat_scores)))
-        k = int(sparsity_ratio * total_size)
-        if k == 0:
+        num_params = ops.size(flat_scores)
+        num_to_prune = ops.cast(
+            ops.cast(num_params, "float32") * sparsity_ratio, "int32"
+        )
+
+        if num_to_prune >= num_params:
+            return ops.zeros_like(weights_tensor, dtype="bool")
+        if num_to_prune == 0:
             return ops.ones_like(weights_tensor, dtype="bool")
 
-        sorted_scores = ops.sort(flat_scores)
-        threshold = sorted_scores[k]
-        return saliency_scores > threshold
+        # Find the indices of the weights with the smallest scores to prune.
+        # We find the top 'k' of the negated scores.
+        _, bottom_k_indices = ops.top_k(-flat_scores, k=num_to_prune)
+
+        # Create a mask that keeps all weights by default.
+        mask_flat = ops.ones(shape=(num_params,), dtype="bool")
+        # Set the weights to be pruned to False.
+        updates = ops.zeros(shape=(num_to_prune,), dtype="bool")
+        indices = ops.expand_dims(bottom_k_indices, axis=1)
+
+        mask_flat = ops.scatter_update(mask_flat, indices, updates)
+        return ops.reshape(mask_flat, ops.shape(saliency_scores))
 
     def calculate_scores(self, weights, **kwargs):
         """Calculate saliency scores: |weight * gradient|."""
@@ -407,14 +464,27 @@ class TaylorPruning(PruningMethod):
         taylor_scores = self._compute_taylor_scores(weights, **kwargs)
 
         flat_scores = ops.reshape(taylor_scores, [-1])
-        total_size = int(backend.convert_to_numpy(ops.size(flat_scores)))
-        k = int(sparsity_ratio * total_size)
-        if k == 0:
+        num_params = ops.size(flat_scores)
+        num_to_prune = ops.cast(
+            ops.cast(num_params, "float32") * sparsity_ratio, "int32"
+        )
+
+        if num_to_prune >= num_params:
+            return ops.zeros_like(weights_tensor, dtype="bool")
+        if num_to_prune == 0:
             return ops.ones_like(weights_tensor, dtype="bool")
 
-        sorted_scores = ops.sort(flat_scores)
-        threshold = sorted_scores[k]
-        return taylor_scores > threshold
+        # Find the indices of the weights with the smallest scores to prune.
+        _, bottom_k_indices = ops.top_k(-flat_scores, k=num_to_prune)
+
+        # Create a mask that keeps all weights by default.
+        mask_flat = ops.ones(shape=(num_params,), dtype="bool")
+        # Set the weights to be pruned to False.
+        updates = ops.zeros(shape=(num_to_prune,), dtype="bool")
+        indices = ops.expand_dims(bottom_k_indices, axis=1)
+
+        mask_flat = ops.scatter_update(mask_flat, indices, updates)
+        return ops.reshape(mask_flat, ops.shape(taylor_scores))
 
     def _compute_taylor_scores(self, weights, **kwargs):
         """Efficient Taylor scores computation."""
