@@ -1,11 +1,38 @@
 """Pruning method classes for different pruning algorithms."""
 
 import abc
+import tensorflow as tf
 
 from keras.src import backend
 from keras.src import ops
 from keras.src.api_export import keras_export
+from keras.src.trainers.data_adapters import data_adapter_utils
 
+
+
+# To verify GPU usage, you can add the following lines at the start of your
+# script:
+# import tensorflow as tf
+# tf.debugging.set_log_device_placement(True)
+
+
+def _validate_gradient_method_requirements(method_name, model, dataset):
+    """Minimal validation for gradient-based pruning methods."""
+    if model is None:
+        raise ValueError(
+            f"{method_name} requires 'model' parameter. Pass model through "
+            "model.prune() kwargs."
+        )
+    if not hasattr(model, "compiled") or not model.compiled:
+        raise ValueError(
+            f"{method_name} requires a compiled model. Please call "
+            "`model.compile()` before pruning."
+        )
+    if dataset is None:
+        raise ValueError(
+            f"{method_name} requires 'dataset' parameter. Pass dataset as "
+            "tuple (x, y) through model.prune() kwargs."
+        )
 
 
 @keras_export("keras.pruning.PruningMethod")
@@ -24,12 +51,12 @@ class PruningMethod(abc.ABC):
     def _find_target_weight_variable(self, model, weights_tensor):
         """Find the target weight variable in the model that matches the given weights."""
         trainable_weights = model.trainable_variables
-        
+
         # First try exact shape and identity matching
         for weight in trainable_weights:
             if weight is weights_tensor:
                 return weight
-                
+
         # Then try shape and value matching
         for weight in trainable_weights:
             if ops.shape(weight) == ops.shape(weights_tensor):
@@ -44,14 +71,265 @@ class PruningMethod(abc.ABC):
                 )
                 if diff < 1e-4:  # More lenient threshold
                     return weight
-                    
+
         # Debug: Print shapes to help identify the issue
         print(f"Target shape: {ops.shape(weights_tensor)}")
         print(f"Available shapes: {[ops.shape(w) for w in trainable_weights]}")
-        
+
         raise ValueError(
             f"Could not find target weight variable with shape "
             f"{ops.shape(weights_tensor)} in {len(trainable_weights)} trainable variables."
+        )
+
+    def _compute_gradients(self, weights, **kwargs):
+        """Compute per-variable averaged gradients over `dataset`.
+
+        Returns the gradient tensor for the target weight `weights`.
+        Expects `kwargs` to contain `model` and `dataset`.
+        """
+        model = kwargs.get("model")
+        dataset = kwargs.get("dataset")
+
+        _validate_gradient_method_requirements(
+            "Gradient-based pruning", model, dataset
+        )
+
+        trainable_variables = tuple(model.trainable_variables)
+        cache_key = (id(model), id(dataset), "grads")
+
+        if cache_key not in self._all_gradients_cache:
+            start_time = tf.timestamp()
+            tf.print("[DEBUG] Starting gradient computation...")
+            if isinstance(dataset, tuple):
+                x_data, y_data = dataset
+                # Move data to GPU upfront to avoid per-batch transfer overhead.
+                with tf.device("/GPU:0"):
+                    x_data_gpu = tf.constant(x_data)
+                    y_data_gpu = tf.constant(y_data)
+                tf_dataset = (
+                    tf.data.Dataset.from_tensor_slices((x_data_gpu, y_data_gpu))
+                    .batch(32)
+                    .prefetch(tf.data.AUTOTUNE)
+                )
+            else:
+                # For large datasets, prefetch to GPU.
+                tf_dataset = dataset.prefetch(tf.data.AUTOTUNE)
+
+            # Use tf.data.Dataset.reduce for in-graph accumulation
+            @tf.function
+            def reduce_func(state, batch):
+                *sum_grads, num_batches = state
+                x, y, sample_weight = (
+                    data_adapter_utils.unpack_x_y_sample_weight(batch)
+                )
+
+                with tf.GradientTape() as tape:
+                    preds = model(x, training=True)
+                    loss = model._compute_loss(
+                        x=x,
+                        y=y,
+                        y_pred=preds,
+                        sample_weight=sample_weight,
+                        training=True,
+                    )
+                    if getattr(model, "optimizer", None) and hasattr(
+                        model.optimizer, "scale_loss"
+                    ):
+                        loss = model.optimizer.scale_loss(loss)
+
+                grads = tape.gradient(loss, trainable_variables)
+                if getattr(model, "optimizer", None) and hasattr(
+                    model.optimizer, "unscale_gradients"
+                ):
+                    grads = model.optimizer.unscale_gradients(grads)
+
+                sum_grads = [
+                    s + g if g is not None else s
+                    for s, g in zip(sum_grads, grads)
+                ]
+                num_batches += 1
+                return tuple(sum_grads) + (num_batches,)
+
+            initial_state = tuple(
+                [ops.zeros_like(v) for v in trainable_variables]
+            ) + (tf.constant(0, dtype=tf.int64),)
+
+            reduce_start_time = tf.timestamp()
+            tf.print("[DEBUG] Starting tf.data.Dataset.reduce for grads...")
+            final_state = tf_dataset.reduce(initial_state, reduce_func)
+            reduce_end_time = tf.timestamp()
+            tf.print(
+                "[DEBUG] Finished tf.data.Dataset.reduce for grads. Time taken:",
+                reduce_end_time - reduce_start_time,
+                "seconds.",
+            )
+
+            sum_grads = final_state[:-1]
+            num_batches = final_state[-1]
+
+            if num_batches > 0:
+                avg_grads = [
+                    tf.math.divide_no_nan(g, tf.cast(num_batches, g.dtype))
+                    for g in sum_grads
+                ]
+            else:
+                avg_grads = sum_grads
+
+            self._all_gradients_cache[cache_key] = list(avg_grads)
+            end_time = tf.timestamp()
+            tf.print(
+                "[DEBUG] Finished gradient computation. Total time:",
+                end_time - start_time,
+                "seconds.",
+            )
+
+        all_gradients = self._all_gradients_cache[cache_key]
+        target_weight_var = self._find_target_weight_variable(model, weights)
+        target_index = -1
+        for i, v in enumerate(model.trainable_variables):
+            if v is target_weight_var:
+                target_index = i
+                break
+        if target_index == -1:
+            raise ValueError(
+                "Target variable not found in model.trainable_variables"
+            )
+        return all_gradients[target_index]
+
+    def _compute_gradient_statistics(self, weights, **kwargs):
+        """Compute (E[g], E[g^2]) per trainable variable over the dataset.
+
+        Returns the pair of tensors for the requested weight.
+        """
+        model = kwargs.get("model")
+        dataset = kwargs.get("dataset")
+
+        _validate_gradient_method_requirements(
+            "Gradient-based pruning", model, dataset
+        )
+
+        trainable_variables = tuple(model.trainable_variables)
+        cache_key = (id(model), id(dataset), "stats")
+
+        if cache_key not in self._all_gradients_cache:
+            start_time = tf.timestamp()
+            tf.print("[DEBUG] Starting gradient statistics computation...")
+            if isinstance(dataset, tuple):
+                x_data, y_data = dataset
+                # Move data to GPU upfront to avoid per-batch transfer overhead.
+                with tf.device("/GPU:0"):
+                    x_data_gpu = tf.constant(x_data)
+                    y_data_gpu = tf.constant(y_data)
+                tf_dataset = (
+                    tf.data.Dataset.from_tensor_slices((x_data_gpu, y_data_gpu))
+                    .batch(64)
+                    .prefetch(tf.data.AUTOTUNE)
+                )
+            else:
+                # For large datasets, prefetch to GPU.
+                tf_dataset = dataset.prefetch(tf.data.AUTOTUNE)
+
+            # Use tf.data.Dataset.reduce for in-graph accumulation
+            @tf.function
+            def reduce_func(state, batch):
+                num_vars = len(trainable_variables)
+                sum_grads = state[:num_vars]
+                sum_sq_grads = state[num_vars : 2 * num_vars]
+                num_batches = state[-1]
+
+                x, y, sample_weight = (
+                    data_adapter_utils.unpack_x_y_sample_weight(batch)
+                )
+
+                with tf.GradientTape() as tape:
+                    preds = model(x, training=True)
+                    loss = model._compute_loss(
+                        x=x,
+                        y=y,
+                        y_pred=preds,
+                        sample_weight=sample_weight,
+                        training=True,
+                    )
+                    if getattr(model, "optimizer", None) and hasattr(
+                        model.optimizer, "scale_loss"
+                    ):
+                        loss = model.optimizer.scale_loss(loss)
+
+                grads = tape.gradient(loss, trainable_variables)
+                if getattr(model, "optimizer", None) and hasattr(
+                    model.optimizer, "unscale_gradients"
+                ):
+                    grads = model.optimizer.unscale_gradients(grads)
+
+                sum_grads = [
+                    s + g if g is not None else s
+                    for s, g in zip(sum_grads, grads)
+                ]
+                sum_sq_grads = [
+                    s + tf.square(g) if g is not None else s
+                    for s, g in zip(sum_sq_grads, grads)
+                ]
+                num_batches += 1
+                return tuple(sum_grads) + tuple(sum_sq_grads) + (num_batches,)
+
+            num_vars = len(trainable_variables)
+            initial_state = (
+                tuple([ops.zeros_like(v) for v in trainable_variables])
+                + tuple([ops.zeros_like(v) for v in trainable_variables])
+                + (tf.constant(0, dtype=tf.int64),)
+            )
+
+            reduce_start_time = tf.timestamp()
+            tf.print("[DEBUG] Starting tf.data.Dataset.reduce for stats...")
+            final_state = tf_dataset.reduce(initial_state, reduce_func)
+            reduce_end_time = tf.timestamp()
+            tf.print(
+                "[DEBUG] Finished tf.data.Dataset.reduce for stats. Time taken:",
+                reduce_end_time - reduce_start_time,
+                "seconds.",
+            )
+
+            sum_grads = final_state[:num_vars]
+            sum_sq_grads = final_state[num_vars : 2 * num_vars]
+            num_batches = final_state[-1]
+
+            if num_batches > 0:
+                avg_grads = [
+                    tf.math.divide_no_nan(g, tf.cast(num_batches, g.dtype))
+                    for g in sum_grads
+                ]
+                avg_sq_grads = [
+                    tf.math.divide_no_nan(g, tf.cast(num_batches, g.dtype))
+                    for g in sum_sq_grads
+                ]
+                stats = (avg_grads, avg_sq_grads)
+            else:
+                stats = (list(sum_grads), list(sum_sq_grads))
+
+            self._all_gradients_cache[cache_key] = stats
+            end_time = tf.timestamp()
+            tf.print(
+                "[DEBUG] Finished gradient statistics computation. Total time:",
+                end_time - start_time,
+                "seconds.",
+            )
+
+        all_gradients, all_squared_gradients = self._all_gradients_cache[
+            cache_key
+        ]
+        target_weight_var = self._find_target_weight_variable(model, weights)
+        target_index = -1
+        for i, v in enumerate(model.trainable_variables):
+            if v is target_weight_var:
+                target_index = i
+                break
+        if target_index == -1:
+            raise ValueError(
+                "Target variable not found in model.trainable_variables"
+            )
+        return (
+            all_gradients[target_index],
+            all_squared_gradients[target_index],
         )
 
 
@@ -118,6 +396,8 @@ class SaliencyPruning(PruningMethod):
     """Gradient-based saliency pruning method."""
 
     def compute_mask(self, weights, sparsity_ratio, **kwargs):
+        overall_start_time = tf.timestamp()
+        tf.print("[DEBUG] SaliencyPruning.compute_mask started.")
         weights_tensor = (
             weights.value()
             if hasattr(weights, "value") and callable(weights.value)
@@ -128,18 +408,15 @@ class SaliencyPruning(PruningMethod):
         if sparsity_ratio >= 1:
             return ops.zeros_like(weights_tensor, dtype="bool")
 
-        model = kwargs.get("model")
-        loss_fn = kwargs.get("loss_fn")
-        dataset = kwargs.get("dataset")
-        loss_fn = _validate_gradient_method_requirements(
-            "SaliencyPruning", model, dataset, loss_fn
+        score_start_time = tf.timestamp()
+        tf.print("[DEBUG] Calculating saliency scores...")
+        saliency_scores = self.calculate_scores(weights, **kwargs)
+        score_end_time = tf.timestamp()
+        tf.print(
+            "[DEBUG] Saliency score calculation took:",
+            score_end_time - score_start_time,
+            "seconds.",
         )
-        kwargs["loss_fn"] = loss_fn
-        
-        # Clear cache to avoid stale gradients
-        self._all_gradients_cache.clear()
-        
-        saliency_scores = self.calculate_scores(weights_tensor, **kwargs)
 
         flat_scores = ops.reshape(saliency_scores, [-1])
         num_params = ops.size(flat_scores)
@@ -163,12 +440,24 @@ class SaliencyPruning(PruningMethod):
         indices = ops.expand_dims(bottom_k_indices, axis=1)
 
         mask_flat = ops.scatter_update(mask_flat, indices, updates)
+
+        overall_end_time = tf.timestamp()
+        tf.print(
+            "[DEBUG] SaliencyPruning.compute_mask finished. Total time:",
+            overall_end_time - overall_start_time,
+            "seconds.",
+        )
         return ops.reshape(mask_flat, ops.shape(saliency_scores))
 
     def calculate_scores(self, weights, **kwargs):
         """Calculate saliency scores: |weight * gradient|."""
         gradients = self._compute_gradients(weights, **kwargs)
-        return ops.abs(weights * gradients)
+        weights_tensor = (
+            weights.value()
+            if hasattr(weights, "value") and callable(weights.value)
+            else weights
+        )
+        return ops.abs(weights_tensor * gradients)
 
 
 @keras_export("keras.pruning.TaylorPruning")
@@ -180,6 +469,8 @@ class TaylorPruning(PruningMethod):
         self.use_fisher_approximation = use_fisher_approximation
 
     def compute_mask(self, weights, sparsity_ratio, **kwargs):
+        overall_start_time = tf.timestamp()
+        tf.print("[DEBUG] TaylorPruning.compute_mask started.")
         weights_tensor = (
             weights.value()
             if hasattr(weights, "value") and callable(weights.value)
@@ -190,14 +481,15 @@ class TaylorPruning(PruningMethod):
         if sparsity_ratio >= 1:
             return ops.zeros_like(weights_tensor, dtype="bool")
 
-        model = kwargs.get("model")
-        loss_fn = kwargs.get("loss_fn")
-        dataset = kwargs.get("dataset")
-        loss_fn = _validate_gradient_method_requirements(
-            "TaylorPruning", model, dataset, loss_fn
-        )
-        kwargs["loss_fn"] = loss_fn
+        score_start_time = tf.timestamp()
+        tf.print("[DEBUG] Calculating taylor scores...")
         taylor_scores = self._compute_taylor_scores(weights, **kwargs)
+        score_end_time = tf.timestamp()
+        tf.print(
+            "[DEBUG] Taylor score calculation took:",
+            score_end_time - score_start_time,
+            "seconds.",
+        )
 
         flat_scores = ops.reshape(taylor_scores, [-1])
         num_params = ops.size(flat_scores)
@@ -220,6 +512,13 @@ class TaylorPruning(PruningMethod):
         indices = ops.expand_dims(bottom_k_indices, axis=1)
 
         mask_flat = ops.scatter_update(mask_flat, indices, updates)
+
+        overall_end_time = tf.timestamp()
+        tf.print(
+            "[DEBUG] TaylorPruning.compute_mask finished. Total time:",
+            overall_end_time - overall_start_time,
+            "seconds.",
+        )
         return ops.reshape(mask_flat, ops.shape(taylor_scores))
 
     def _compute_taylor_scores(self, weights, **kwargs):
@@ -230,7 +529,7 @@ class TaylorPruning(PruningMethod):
             else weights
         )
         gradients, squared_gradients = self._compute_gradient_statistics(
-            weights_tensor_val, **kwargs
+            weights, **kwargs
         )
         first_order_term = ops.abs(gradients * weights_tensor_val)
         second_order_term = self.second_order_weight * ops.abs(
