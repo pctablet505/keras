@@ -30,64 +30,64 @@ def _get_tf_gradient_function(use_fisher):
             Keras training pattern.
             """
             accumulated_gradients = [
-                tf.zeros_like(v) for v in trainable_variables
+                tf.Variable(tf.zeros_like(v), trainable=False)
+                for v in trainable_variables
             ]
             if use_fisher:
                 accumulated_squared_gradients = [
-                    tf.zeros_like(v) for v in trainable_variables
+                    tf.Variable(tf.zeros_like(v), trainable=False)
+                    for v in trainable_variables
                 ]
-            num_batches = tf.constant(0.0)
+            total_samples = tf.constant(0.0)
 
             for batch_x, batch_y in tf_dataset:
-                with tf.GradientTape(persistent=True) as tape:
+                with tf.GradientTape(persistent=False) as tape:
                     # Set model to training mode for meaningful gradients
                     predictions = model(batch_x, training=True)
                     loss_val = loss_fn(batch_y, predictions)
-                    loss = tf.reduce_mean(loss_val)
+                    # Ensure scalar loss
+                    loss = (
+                        tf.reduce_mean(loss_val)
+                        if tf.rank(loss_val) > 0
+                        else tf.identity(loss_val)
+                    )
 
                 batch_gradients = tape.gradient(loss, trainable_variables)
 
+                # Determine per-batch sample size to weight gradients like Keras
+                # does with "sum_over_batch_size" across variable batch sizes.
+                # Use the first tensor in the (potentially nested) batch_x.
+                # Note: tf.nest is available via TensorFlow.
+                batch_first_tensor = tf.nest.flatten(batch_x)[0]
+                batch_size = tf.cast(tf.shape(batch_first_tensor)[0], tf.float32)
+
                 for i, grad in enumerate(batch_gradients):
-                    if grad is not None:
-                        accumulated_gradients[i] += grad
+                    # Treat None gradients as zeros (variable not involved)
+                    if grad is None:
+                        grad = tf.zeros_like(trainable_variables[i])
 
-                if use_fisher:
-                    # Fisher approximation using variance of gradients
-                    if len(loss_val.shape) > 0:
-                        variance_loss = tf.reduce_sum(
-                            tf.square(loss_val - loss)
+                    if use_fisher:
+                        # Taylor/Fisher stats: E[g] and E[g^2]
+                        accumulated_gradients[i].assign_add(grad * batch_size)
+                        accumulated_squared_gradients[i].assign_add(
+                            tf.square(grad) * batch_size
                         )
-                        variance_grads = tape.gradient(
-                            variance_loss, trainable_variables
-                        )
-                        for i, grad in enumerate(variance_grads):
-                            if grad is not None:
-                                accumulated_squared_gradients[i] += (
-                                    tf.square(batch_gradients[i])
-                                    + 0.1 * tf.abs(grad)
-                                )
-                            elif batch_gradients[i] is not None:
-                                accumulated_squared_gradients[
-                                    i
-                                ] += tf.square(batch_gradients[i])
                     else:
-                        for i, grad in enumerate(batch_gradients):
-                            if grad is not None:
-                                accumulated_squared_gradients[i] += (
-                                    tf.square(grad)
-                                )
+                        # Saliency: E[|g|] to avoid sign cancellation
+                        accumulated_gradients[i].assign_add(
+                            tf.abs(grad) * batch_size
+                        )
 
-                del tape
-                num_batches += 1.0
+                total_samples += batch_size
 
             averaged_gradients = [
-                g / num_batches if num_batches > 0 else g
-                for g in accumulated_gradients
+                tf.math.divide_no_nan(var.read_value(), total_samples)
+                for var in accumulated_gradients
             ]
             if use_fisher:
                 averaged_squared_gradients = [
-                    g / num_batches if num_batches > 0 else g
-                    for g in accumulated_squared_gradients
+                    tf.math.divide_no_nan(var.read_value(), total_samples)
+                    for var in accumulated_squared_gradients
                 ]
                 return averaged_gradients, averaged_squared_gradients
             return averaged_gradients, None
