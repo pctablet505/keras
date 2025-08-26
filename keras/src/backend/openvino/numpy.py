@@ -653,9 +653,24 @@ def cumsum(x, axis=None, dtype=None):
 
 
 def deg2rad(x):
-    raise NotImplementedError(
-        "`deg2rad` is not supported with openvino backend"
-    )
+    x = get_ov_output(x)
+    x_type = x.get_element_type()
+    pi_over_180 = np.pi / 180.0
+
+    if x_type == Type.i64:
+        output_type = Type.f64
+    elif x_type.is_integral():
+        output_type = OPENVINO_DTYPES[config.floatx()]
+    else:
+        output_type = x_type
+
+    if x_type != output_type:
+        x = ov_opset.convert(x, output_type)
+
+    const_pi_over_180 = ov_opset.constant(pi_over_180, output_type).output(0)
+    result = ov_opset.multiply(x, const_pi_over_180).output(0)
+
+    return OpenVINOKerasTensor(result)
 
 
 def diag(x, k=0):
@@ -672,7 +687,7 @@ def diff(a, n=1, axis=-1):
     if n == 0:
         return OpenVINOKerasTensor(get_ov_output(a))
     if n < 0:
-        raise ValueError("order must be non-negative but got " + repr(n))
+        raise ValueError(f"order must be non-negative but got {repr(n)}")
     a = get_ov_output(a)
     a_type = a.get_element_type()
     if isinstance(a, np.ndarray):
@@ -887,6 +902,10 @@ def hstack(xs):
     return OpenVINOKerasTensor(ov_opset.concat(elems, axis).output(0))
 
 
+def hypot(x1, x2):
+    raise NotImplementedError("`hypot` is not supported with openvino backend")
+
+
 def identity(n, dtype=None):
     n = get_ov_output(n)
     dtype = Type.f32 if dtype is None else dtype
@@ -946,6 +965,12 @@ def isnan(x):
 def isneginf(x):
     raise NotImplementedError(
         "`isneginf` is not supported with openvino backend"
+    )
+
+
+def isposinf(x):
+    raise NotImplementedError(
+        "`isposinf` is not supported with openvino backend"
     )
 
 
