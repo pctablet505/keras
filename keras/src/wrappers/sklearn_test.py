@@ -91,33 +91,14 @@ def use_floatx(x):
 
 EXPECTED_FAILED_CHECKS = {
     "SKLearnClassifier": {
-        "check_classifiers_regression_target": "not an issue in sklearn>=1.6",
-        "check_parameters_default_constructible": (
-            "not an issue in sklearn>=1.6"
-        ),
-        "check_classifiers_one_label_sample_weights": (
-            "0 sample weight is not ignored"
-        ),
-        "check_classifiers_classes": (
-            "with small test cases the estimator returns not all classes "
-            "sometimes"
-        ),
         "check_classifier_data_not_an_array": (
             "This test assumes reproducibility in fit."
         ),
         "check_supervised_y_2d": "This test assumes reproducibility in fit.",
         "check_fit_idempotent": "This test assumes reproducibility in fit.",
     },
-    "SKLearnRegressor": {
-        "check_parameters_default_constructible": (
-            "not an issue in sklearn>=1.6"
-        ),
-    },
-    "SKLearnTransformer": {
-        "check_parameters_default_constructible": (
-            "not an issue in sklearn>=1.6"
-        ),
-    },
+    "SKLearnRegressor": {},
+    "SKLearnTransformer": {},
 }
 
 
