@@ -665,12 +665,13 @@ class Model(Trainer, base_trainer.Trainer, Layer):
                 f"{list(available_formats)}."
             )
 
-        # Check if LiteRT export is available (requires TensorFlow backend)
-        if format == "litert" and backend.backend() != "tensorflow":
+        # Check if LiteRT export is available (requires TensorFlow or JAX backend)
+        if format == "litert" and backend.backend() not in ["tensorflow", "jax"]:
             raise ImportError(
-                "LiteRT export requires TensorFlow backend. "
-                "Please set the backend to TensorFlow: "
-                "`keras.backend.set_backend('tensorflow')`"
+                "LiteRT export requires TensorFlow or JAX backend. "
+                "Please set the backend to TensorFlow or JAX: "
+                "`keras.backend.set_backend('tensorflow')` or "
+                "`keras.backend.set_backend('jax')`"
             )
 
         if format == "tf_saved_model":

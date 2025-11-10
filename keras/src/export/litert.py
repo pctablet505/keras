@@ -2,8 +2,10 @@ import logging
 import os
 import traceback
 
+from keras.src import backend
 from keras.src import tree
 from keras.src.utils import io_utils
+from keras.src.utils import summary_utils
 from keras.src.utils.module_utils import litert
 from keras.src.utils.module_utils import tensorflow as tf
 
@@ -203,9 +205,20 @@ class LiteRTExporter:
         Returns:
             A bytes object containing the serialized TFLite model.
         """
+        current_backend = backend.backend()
+        
+        # JAX backend requires jax2tf conversion
+        if current_backend == "jax":
+            if self.verbose:
+                io_utils.print_msg(
+                    "JAX backend detected. Using jax2tf conversion path..."
+                )
+            return self._convert_jax_model(input_signature)
+        
+        # TensorFlow backend can use direct conversion
         is_sequential = isinstance(self.model, tf.keras.Sequential)
 
-        # Try direct conversion first for all models
+        # Try direct conversion first for TensorFlow backend
         try:
             if self.verbose:
                 model_type = "Sequential" if is_sequential else "Functional"
@@ -241,6 +254,202 @@ class LiteRTExporter:
                 )
 
             return self._convert_with_wrapper(input_signature)
+
+    def _convert_jax_model(self, input_signature):
+        """Converts a JAX backend model to TFLite using jax2tf.
+
+        Args:
+            input_signature: Input signature specification
+
+        Returns:
+            A bytes object containing the serialized TFLite model.
+        
+        Raises:
+            RuntimeError: If model is too large for jax2tf conversion
+        """
+        try:
+            # Import jax2tf for JAX to TensorFlow conversion
+            from jax.experimental import jax2tf
+        except ImportError:
+            raise ImportError(
+                "jax2tf is required for JAX backend LiteRT export. "
+                "Please install JAX with: pip install jax jaxlib"
+            )
+
+        # Estimate model size and warn if it may exceed protobuf limit
+        num_params = summary_utils.count_params(self.model.trainable_variables)
+        if self.verbose:
+            io_utils.print_msg(
+                f"Model has {num_params:,} trainable parameters"
+            )
+        
+        # Warn if model is large (>200M params typically hits 2GB limit)
+        if num_params > 200_000_000:
+            io_utils.print_msg(
+                f"WARNING: Large model detected ({num_params:,} parameters). "
+                f"JAX backend export may fail due to protobuf 2GB limit. "
+                f"Consider using TensorFlow backend for models >200M parameters."
+            )
+
+        if self.verbose:
+            io_utils.print_msg(
+                "Converting JAX model to TensorFlow using jax2tf..."
+            )
+
+        # Prepare input signature
+        if not isinstance(input_signature, (list, tuple)):
+            input_signature = [input_signature]
+
+        from keras.src.export.export_utils import make_tf_tensor_spec
+        
+        # Convert input signature to tensor specs, handling structures
+        tensor_specs = []
+        for spec in input_signature:
+            if isinstance(spec, (list, tuple)):
+                # Handle list/tuple of specs
+                tensor_specs.extend([make_tf_tensor_spec(s) for s in spec])
+            elif isinstance(spec, dict):
+                # Handle dict of specs - flatten to list
+                tensor_specs.extend([make_tf_tensor_spec(s) for s in spec.values()])
+            else:
+                # Single spec
+                tensor_specs.append(make_tf_tensor_spec(spec))
+
+        # Create a wrapper function that calls the model
+        def model_fn(*args):
+            """Wrapper function for JAX model."""
+            if len(args) == 1:
+                return self.model(args[0])
+            else:
+                return self.model(list(args))
+        
+        # Build polymorphic_shapes for dynamic batch dimension
+        # Format: 'b, ...' where 'b' is the batch dimension variable
+        polymorphic_shapes = []
+        for spec in tensor_specs:
+            shape = spec.shape
+            if shape.rank is None or shape.rank == 0:
+                polymorphic_shapes.append(None)
+            else:
+                # Create shape string with 'b' for batch dimension and concrete sizes for others
+                shape_str = ', '.join(
+                    'b' if (i == 0 and dim is None) else str(dim) if dim is not None else '_'
+                    for i, dim in enumerate(shape.as_list())
+                )
+                polymorphic_shapes.append(shape_str)
+        
+        # Convert the JAX function to TensorFlow using jax2tf
+        if self.verbose:
+            io_utils.print_msg("Converting JAX function using jax2tf...")
+            io_utils.print_msg(f"Polymorphic shapes: {polymorphic_shapes}")
+        
+        tf_fn = jax2tf.convert(
+            model_fn,
+            enable_xla=False,
+            polymorphic_shapes=polymorphic_shapes,
+        )
+        
+        # Wrap in tf.Module for proper variable tracking
+        class JAXModelWrapper(tf.Module):
+            """Wrapper for jax2tf converted function."""
+            
+            def __init__(self, tf_fn, model):
+                super().__init__()
+                self._tf_fn = tf_fn
+                
+                # Track all variables from the Keras model
+                with self.name_scope:
+                    for i, var in enumerate(model.variables):
+                        setattr(self, f"model_var_{i}", var)
+
+            @tf.function
+            def __call__(self, *args):
+                """Entry point for the exported model."""
+                return self._tf_fn(*args)
+
+        wrapper = JAXModelWrapper(tf_fn, self.model)
+
+        # Get concrete function
+        concrete_func = wrapper.__call__.get_concrete_function(*tensor_specs)
+
+        if self.verbose:
+            io_utils.print_msg(
+                "Converting concrete function to TFLite format..."
+            )
+
+        # Try conversion with different strategies
+        conversion_strategies = [
+            {
+                "experimental_enable_resource_variables": False,
+                "name": "without resource variables",
+            },
+            {
+                "experimental_enable_resource_variables": True,
+                "name": "with resource variables",
+            },
+        ]
+
+        last_error = None
+        for strategy in conversion_strategies:
+            try:
+                converter = tf.lite.TFLiteConverter.from_concrete_functions(
+                    [concrete_func], trackable_obj=wrapper
+                )
+                converter.target_spec.supported_ops = [
+                    tf.lite.OpsSet.TFLITE_BUILTINS,
+                    tf.lite.OpsSet.SELECT_TF_OPS,
+                ]
+                converter.experimental_enable_resource_variables = strategy[
+                    "experimental_enable_resource_variables"
+                ]
+
+                # Apply any additional converter settings from kwargs
+                self._apply_converter_kwargs(converter)
+
+                if self.verbose:
+                    io_utils.print_msg(
+                        f"Trying conversion {strategy['name']}..."
+                    )
+
+                tflite_model = converter.convert()
+
+                if self.verbose:
+                    io_utils.print_msg(
+                        f"JAX model conversion successful {strategy['name']}!"
+                    )
+
+                return tflite_model
+
+            except Exception as e:
+                last_error = e
+                if self.verbose:
+                    io_utils.print_msg(
+                        f"Conversion failed {strategy['name']}: {e}"
+                    )
+                
+                # Check if this is a protobuf size error
+                error_msg = str(e).lower()
+                if any(
+                    indicator in error_msg
+                    for indicator in ["2gb", "size limit", "too large", "exceeds"]
+                ):
+                    raise RuntimeError(
+                        f"Model is too large for JAX backend export. "
+                        f"The model has {num_params:,} parameters. "
+                        f"JAX backend export is limited by the protobuf 2GB size limit. "
+                        f"For large models (>200M parameters), please use the TensorFlow backend instead. "
+                        f"Original error: {e}"
+                    )
+                continue
+
+        # If all strategies fail, raise the last error with helpful message
+        raise RuntimeError(
+            f"All conversion strategies failed for JAX model. "
+            f"If this is a large model ({num_params:,} parameters), "
+            f"the protobuf 2GB limit may be the issue. "
+            f"Consider using TensorFlow backend for large models. "
+            f"Last error: {last_error}"
+        )
 
     def _convert_with_wrapper(self, input_signature):
         """Converts the model to TFLite using the tf.Module wrapper.

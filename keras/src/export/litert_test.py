@@ -21,7 +21,7 @@ from keras.src.utils.module_utils import tensorflow
 AI_EDGE_LITERT_AVAILABLE = False
 LiteRTInterpreter = None
 
-if backend.backend() == "tensorflow":
+if backend.backend() in ["tensorflow", "jax"]:
     if litert.available:
         try:
             from ai_edge_litert.interpreter import (
@@ -167,14 +167,17 @@ def _get_interpreter_outputs(interpreter):
 
 
 @pytest.mark.skipif(
-    backend.backend() != "tensorflow",
-    reason="`export_litert` currently supports the TensorFlow backend only.",
+    backend.backend() not in ["tensorflow", "jax"],
+    reason="`export_litert` currently supports TensorFlow and JAX backends only.",
 )
 class ExportLitertTest(testing.TestCase):
     """Test suite for LiteRT (TFLite) model export functionality.
 
     Tests use AI Edge LiteRT interpreter when available, otherwise fall back
     to TensorFlow Lite interpreter for validation.
+    
+    Supports both TensorFlow and JAX backends. Note that JAX backend has
+    limitations for large models due to protobuf 2GB size limit.
     """
 
     @parameterized.named_parameters(named_product(model_type=model_types))
