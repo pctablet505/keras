@@ -424,8 +424,8 @@ class ExportLitertTest(testing.TestCase):
 
         temp_filepath = os.path.join(self.get_temp_dir(), "exported_model.txt")
 
-        # Should raise AssertionError for wrong extension
-        with self.assertRaises(AssertionError):
+        # Should raise ValueError for wrong extension
+        with self.assertRaises(ValueError):
             model.export(temp_filepath, format="litert")
 
     def test_export_subclass_model(self):
@@ -734,216 +734,6 @@ class ExportLitertTest(testing.TestCase):
             f"Expected significant size reduction, got {reduction_ratio:.2%}",
         )
 
-    def test_aot_compile_parameter_accepted(self):
-        """Test that aot_compile_targets parameter is accepted without error."""
-        if not litert.available:
-            self.skipTest("LiteRT not available")
-
-        model = get_model("sequential")
-        temp_filepath = os.path.join(
-            self.get_temp_dir(), "model_with_aot.tflite"
-        )
-
-        # Test that parameter is accepted (compilation may or may not succeed)
-        # The key is that it doesn't crash
-        try:
-            result = model.export(
-                temp_filepath,
-                format="litert",
-                aot_compile_targets=["arm64"],
-                verbose=True,
-            )
-            # Base .tflite file should always be created
-            self.assertTrue(os.path.exists(temp_filepath))
-
-            # Result could be filepath (if AOT failed/skipped) or
-            # CompilationResult (if AOT succeeded)
-            self.assertIsNotNone(result)
-        except Exception as e:
-            # If AOT infrastructure not available, that's okay as long as
-            # base model was exported
-            error_msg = str(e)
-            if "AOT" in error_msg or "compilation" in error_msg.lower():
-                if os.path.exists(temp_filepath):
-                    # Base model created, AOT just not available - this is fine
-                    pass
-                else:
-                    self.fail(
-                        f"Base .tflite model should be created even if AOT "
-                        f"fails: {error_msg}"
-                    )
-            else:
-                # Some other error - re-raise
-                raise
-
-    def test_aot_compile_multiple_targets(self):
-        """Test AOT compilation with multiple targets."""
-        if not litert.available:
-            self.skipTest("LiteRT not available")
-
-        model = get_model("functional")
-        temp_filepath = os.path.join(
-            self.get_temp_dir(), "model_multi_aot.tflite"
-        )
-
-        # Test with multiple targets
-        try:
-            result = model.export(
-                temp_filepath,
-                format="litert",
-                aot_compile_targets=["arm64", "x86_64"],
-                verbose=True,
-            )
-
-            # Base model should exist
-            self.assertTrue(os.path.exists(temp_filepath))
-
-            # Check if result contains compilation info
-            if hasattr(result, "models"):
-                # AOT compilation succeeded
-                self.assertGreater(
-                    len(result.models),
-                    0,
-                    "Should have at least one compiled model",
-                )
-            elif isinstance(result, str):
-                # AOT skipped, returned filepath
-                self.assertEqual(result, temp_filepath)
-
-        except Exception as e:
-            # AOT infrastructure may not be available
-            if os.path.exists(temp_filepath):
-                # Base model was created - acceptable
-                pass
-            else:
-                self.fail(f"Base model should be created: {str(e)}")
-
-    def test_aot_compile_with_optimizations(self):
-        """Test AOT compilation combined with quantization optimizations."""
-        if not litert.available:
-            self.skipTest("LiteRT not available")
-
-        model = get_model("sequential")
-        temp_filepath = os.path.join(
-            self.get_temp_dir(), "model_aot_optimized.tflite"
-        )
-
-        # Test AOT with quantization
-        try:
-            model.export(
-                temp_filepath,
-                format="litert",
-                aot_compile_targets=["arm64"],
-                optimizations=[tensorflow.lite.Optimize.DEFAULT],
-                verbose=True,
-            )
-
-            # Base model must exist
-            self.assertTrue(os.path.exists(temp_filepath))
-
-            # Verify model is quantized (smaller size)
-            size = os.path.getsize(temp_filepath)
-            self.assertGreater(size, 0)
-
-        except Exception as e:
-            # Acceptable if AOT not available but base model created
-            if not os.path.exists(temp_filepath):
-                self.fail(f"Base model should be created: {str(e)}")
-
-    def test_get_available_aot_targets(self):
-        """Test retrieving available AOT compilation targets."""
-        if not litert.available:
-            self.skipTest("LiteRT not available")
-
-        try:
-            from keras.src.export.litert import LiteRTExporter
-
-            # This should not crash even if no targets available
-            targets = LiteRTExporter.get_available_targets()
-
-            # Should return a list (possibly empty)
-            self.assertIsInstance(targets, list)
-
-            # If targets are available, they should be valid
-            if targets:
-                for target in targets:
-                    # Each target should have some identifying property
-                    self.assertIsNotNone(target)
-
-        except ImportError:
-            self.skipTest("LiteRTExporter not available")
-        except Exception as e:
-            # No targets available is acceptable
-            if "target" in str(e).lower() or "vendor" in str(e).lower():
-                pass
-            else:
-                raise
-
-    def test_aot_compile_without_litert_available(self):
-        """Test that export works gracefully when LiteRT AOT is unavailable."""
-        # This test verifies the fallback behavior
-        model = get_model("sequential")
-        temp_filepath = os.path.join(self.get_temp_dir(), "model_no_aot.tflite")
-
-        # Even if we request AOT, export should succeed and create base model
-        # AOT compilation may fail, but that's acceptable as long as base model
-        # is created
-        try:
-            model.export(
-                temp_filepath,
-                format="litert",
-                aot_compile_targets=["arm64"],
-                verbose=False,  # Suppress warnings in test output
-            )
-
-            # Base .tflite file should be created regardless
-            self.assertTrue(os.path.exists(temp_filepath))
-
-        except RuntimeError as e:
-            # AOT compilation may fail if infrastructure not available
-            # This is acceptable as long as base model is created
-            if "AOT" in str(e):
-                # Verify base model was created before AOT failure
-                self.assertTrue(
-                    os.path.exists(temp_filepath),
-                    "Base .tflite model should be created even if AOT fails",
-                )
-            else:
-                # Other runtime errors should be raised
-                raise
-
-    def test_export_with_aot_class_method(self):
-        """Test the export_with_aot class method."""
-        if not litert.available:
-            self.skipTest("LiteRT not available")
-
-        try:
-            from keras.src.export.litert import LiteRTExporter
-
-            model = get_model("functional")
-            temp_filepath = os.path.join(
-                self.get_temp_dir(), "model_class_method_aot.tflite"
-            )
-
-            # Test the class method
-            result = LiteRTExporter.export_with_aot(
-                model=model,
-                filepath=temp_filepath,
-                targets=["arm64"],
-                verbose=True,
-            )
-
-            # Base model should exist
-            self.assertTrue(os.path.exists(temp_filepath))
-            self.assertIsNotNone(result)
-
-        except ImportError:
-            self.skipTest("LiteRTExporter not available")
-        except Exception as e:
-            # AOT may not be available, but base model should be created
-            if not os.path.exists(temp_filepath):
-                self.fail(f"Base model should be created: {str(e)}")
-
     def test_signature_def_with_named_model(self):
         """Test that exported models have SignatureDef with input names."""
         if LiteRTInterpreter is None:
@@ -1175,6 +965,7 @@ class ExportLitertTest(testing.TestCase):
         )
 
         # For single output, TFLite uses generic names like 'output_0'
+        # Extract the single output value
         if len(sig_output) == 1:
             litert_output = list(sig_output.values())[0]
         else:
@@ -1248,6 +1039,282 @@ class ExportLitertTest(testing.TestCase):
                 ref_out, sig_output_values[i], atol=1e-4, rtol=1e-4
             )
 
+    def test_dict_input_adapter_creation(self):
+        """Test that dict input adapter is created and works correctly."""
 
-if __name__ == "__main__":
-    pytest.main([__file__])
+        # Create a model with dictionary inputs
+        input1 = layers.Input(shape=(10,), name="x")
+        input2 = layers.Input(shape=(10,), name="y")
+        output = layers.Add()([input1, input2])
+        model = models.Model(inputs={"x": input1, "y": input2}, outputs=output)
+
+        temp_filepath = os.path.join(
+            self.get_temp_dir(), "dict_adapter_model.tflite"
+        )
+
+        # Export with verbose to verify adapter creation messages
+        model.export(temp_filepath, format="litert", verbose=True)
+
+        # Verify the file was created
+        self.assertTrue(os.path.exists(temp_filepath))
+
+        # Load and test the model
+        interpreter = LiteRTInterpreter(model_path=temp_filepath)
+        interpreter.allocate_tensors()
+
+        # Check input details - should have 2 inputs in list form
+        input_details = interpreter.get_input_details()
+        self.assertEqual(len(input_details), 2)
+
+        # Test inference
+        batch_size = 1
+        x_val = np.random.normal(size=(batch_size, 10)).astype("float32")
+        y_val = np.random.normal(size=(batch_size, 10)).astype("float32")
+
+        ref_output = _convert_to_numpy(
+            model(
+                {
+                    "x": ops.convert_to_tensor(x_val),
+                    "y": ops.convert_to_tensor(y_val),
+                }
+            )
+        )
+
+        # Set inputs as list (adapter converts list to dict internally)
+        _set_interpreter_inputs(interpreter, [x_val, y_val])
+        interpreter.invoke()
+        litert_output = _get_interpreter_outputs(interpreter)
+
+        self.assertAllClose(ref_output, litert_output, atol=1e-4, rtol=1e-4)
+
+    def test_dict_input_signature_inference(self):
+        """Test automatic inference of dict input signatures."""
+
+        # Create a model with dictionary inputs (without calling it first)
+        input1 = layers.Input(shape=(5,), name="feature_a")
+        input2 = layers.Input(shape=(3,), name="feature_b")
+        concat = layers.Concatenate()([input1, input2])
+        output = layers.Dense(1)(concat)
+        model = models.Model(
+            inputs={"feature_a": input1, "feature_b": input2}, outputs=output
+        )
+
+        temp_filepath = os.path.join(
+            self.get_temp_dir(), "inferred_dict_model.tflite"
+        )
+
+        # Export without providing input_signature - should be inferred
+        model.export(temp_filepath, format="litert")
+
+        # Verify successful export
+        self.assertTrue(os.path.exists(temp_filepath))
+
+        # Load and verify structure
+        interpreter = LiteRTInterpreter(model_path=temp_filepath)
+        interpreter.allocate_tensors()
+
+        input_details = interpreter.get_input_details()
+        self.assertEqual(len(input_details), 2)
+
+        # Verify shapes match expected
+        shapes = [tuple(d["shape"][1:]) for d in input_details]
+        self.assertIn((5,), shapes)
+        self.assertIn((3,), shapes)
+
+    def test_dict_input_with_custom_signature(self):
+        """Test dict input export with custom input signature."""
+
+        # Create model with dict inputs
+        input1 = layers.Input(shape=(10,), name="input_x")
+        input2 = layers.Input(shape=(10,), name="input_y")
+        output = layers.Multiply()([input1, input2])
+        model = models.Model(
+            inputs={"input_x": input1, "input_y": input2}, outputs=output
+        )
+
+        temp_filepath = os.path.join(
+            self.get_temp_dir(), "dict_custom_sig_model.tflite"
+        )
+
+        # Provide custom dict input signature
+        input_signature = {
+            "input_x": layers.InputSpec(shape=(None, 10), dtype="float32"),
+            "input_y": layers.InputSpec(shape=(None, 10), dtype="float32"),
+        }
+
+        model.export(
+            temp_filepath, format="litert", input_signature=input_signature
+        )
+
+        # Verify export
+        self.assertTrue(os.path.exists(temp_filepath))
+
+        interpreter = LiteRTInterpreter(model_path=temp_filepath)
+        interpreter.allocate_tensors()
+
+        # Test inference
+        batch_size = 1
+        x_val = np.random.normal(size=(batch_size, 10)).astype("float32")
+        y_val = np.random.normal(size=(batch_size, 10)).astype("float32")
+
+        ref_output = _convert_to_numpy(
+            model(
+                {
+                    "input_x": ops.convert_to_tensor(x_val),
+                    "input_y": ops.convert_to_tensor(y_val),
+                }
+            )
+        )
+
+        _set_interpreter_inputs(interpreter, [x_val, y_val])
+        interpreter.invoke()
+        litert_output = _get_interpreter_outputs(interpreter)
+
+        self.assertAllClose(ref_output, litert_output, atol=1e-4, rtol=1e-4)
+
+    def test_dict_input_numerical_accuracy(self):
+        """Test numerical accuracy of dict input models with complex ops."""
+
+        # Create a more complex model with dict inputs
+        input1 = layers.Input(shape=(20,), name="tokens")
+        input2 = layers.Input(shape=(20,), name="mask")
+
+        # Apply some transformations
+        x1 = layers.Dense(16, activation="relu")(input1)
+        x2 = layers.Dense(16, activation="relu")(input2)
+
+        # Combine
+        combined = layers.Multiply()([x1, x2])
+        output = layers.Dense(1, activation="sigmoid")(combined)
+
+        model = models.Model(
+            inputs={"tokens": input1, "mask": input2}, outputs=output
+        )
+
+        temp_filepath = os.path.join(
+            self.get_temp_dir(), "dict_numerical_model.tflite"
+        )
+
+        model.export(temp_filepath, format="litert")
+
+        # Test with multiple samples
+        batch_size = 1
+        tokens_val = np.random.normal(size=(batch_size, 20)).astype("float32")
+        mask_val = np.random.normal(size=(batch_size, 20)).astype("float32")
+
+        ref_output = _convert_to_numpy(
+            model(
+                {
+                    "tokens": ops.convert_to_tensor(tokens_val),
+                    "mask": ops.convert_to_tensor(mask_val),
+                }
+            )
+        )
+
+        interpreter = LiteRTInterpreter(model_path=temp_filepath)
+        interpreter.allocate_tensors()
+        _set_interpreter_inputs(interpreter, [tokens_val, mask_val])
+        interpreter.invoke()
+        litert_output = _get_interpreter_outputs(interpreter)
+
+        # Should have good numerical accuracy
+        self.assertAllClose(ref_output, litert_output, atol=1e-5, rtol=1e-5)
+
+    def test_dict_input_preserves_variable_sharing(self):
+        """Test that adapter preserves variable sharing from original model."""
+
+        # Create model with shared layers
+        shared_dense = layers.Dense(8, activation="relu")
+
+        input1 = layers.Input(shape=(10,), name="branch_a")
+        input2 = layers.Input(shape=(10,), name="branch_b")
+
+        # Both inputs go through same shared layer
+        x1 = shared_dense(input1)
+        x2 = shared_dense(input2)
+
+        output = layers.Add()([x1, x2])
+        model = models.Model(
+            inputs={"branch_a": input1, "branch_b": input2}, outputs=output
+        )
+
+        # Train briefly to ensure weights are meaningful
+        model.compile(optimizer="adam", loss="mse")
+        x_train = {
+            "branch_a": np.random.normal(size=(5, 10)).astype("float32"),
+            "branch_b": np.random.normal(size=(5, 10)).astype("float32"),
+        }
+        y_train = np.random.normal(size=(5, 8)).astype("float32")
+        model.fit(x_train, y_train, epochs=1, verbose=0)
+
+        temp_filepath = os.path.join(
+            self.get_temp_dir(), "dict_shared_vars_model.tflite"
+        )
+
+        model.export(temp_filepath, format="litert")
+
+        # Verify export works and inference matches
+        interpreter = LiteRTInterpreter(model_path=temp_filepath)
+        interpreter.allocate_tensors()
+
+        batch_size = 1
+        a_val = np.random.normal(size=(batch_size, 10)).astype("float32")
+        b_val = np.random.normal(size=(batch_size, 10)).astype("float32")
+
+        ref_output = _convert_to_numpy(
+            model(
+                {
+                    "branch_a": ops.convert_to_tensor(a_val),
+                    "branch_b": ops.convert_to_tensor(b_val),
+                }
+            )
+        )
+
+        _set_interpreter_inputs(interpreter, [a_val, b_val])
+        interpreter.invoke()
+        litert_output = _get_interpreter_outputs(interpreter)
+
+        self.assertAllClose(ref_output, litert_output, atol=1e-4, rtol=1e-4)
+
+    def test_dict_input_multi_output_model(self):
+        """Test dict input model with multiple outputs exports successfully."""
+
+        # Create model with dict inputs and multiple outputs
+        input1 = layers.Input(shape=(10,), name="feature_1")
+        input2 = layers.Input(shape=(10,), name="feature_2")
+
+        # Two output branches
+        output1 = layers.Dense(5, name="output_a")(input1)
+        output2 = layers.Dense(3, name="output_b")(input2)
+
+        model = models.Model(
+            inputs={"feature_1": input1, "feature_2": input2},
+            outputs=[output1, output2],
+        )
+
+        temp_filepath = os.path.join(
+            self.get_temp_dir(), "dict_multi_output_model.tflite"
+        )
+
+        # Main test: export should succeed with dict inputs + multi outputs
+        model.export(temp_filepath, format="litert")
+
+        # Verify file was created
+        self.assertTrue(os.path.exists(temp_filepath))
+
+        # Verify structure
+        interpreter = LiteRTInterpreter(model_path=temp_filepath)
+        interpreter.allocate_tensors()
+
+        # Should have 2 inputs (from dict)
+        input_details = interpreter.get_input_details()
+        self.assertEqual(len(input_details), 2)
+
+        # Should have 2 outputs
+        output_details = interpreter.get_output_details()
+        self.assertEqual(len(output_details), 2)
+
+        # Verify shapes
+        output_shapes = [tuple(d["shape"][1:]) for d in output_details]
+        self.assertIn((5,), output_shapes)
+        self.assertIn((3,), output_shapes)

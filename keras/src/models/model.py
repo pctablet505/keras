@@ -702,7 +702,6 @@ class Model(Trainer, base_trainer.Trainer, Layer):
             export_litert(
                 self,
                 filepath,
-                verbose=verbose,
                 input_signature=input_signature,
                 **kwargs,
             )
