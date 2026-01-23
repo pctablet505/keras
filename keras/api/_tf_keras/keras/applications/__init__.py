@@ -18,6 +18,7 @@ from keras.applications import nasnet as nasnet
 from keras.applications import resnet as resnet
 from keras.applications import resnet50 as resnet50
 from keras.applications import resnet_v2 as resnet_v2
+from keras.applications import unet as unet
 from keras.applications import vgg16 as vgg16
 from keras.applications import vgg19 as vgg19
 from keras.applications import xception as xception
@@ -78,6 +79,7 @@ from keras.src.applications.resnet import ResNet152 as ResNet152
 from keras.src.applications.resnet_v2 import ResNet50V2 as ResNet50V2
 from keras.src.applications.resnet_v2 import ResNet101V2 as ResNet101V2
 from keras.src.applications.resnet_v2 import ResNet152V2 as ResNet152V2
+from keras.src.applications.unet import UNet as UNet
 from keras.src.applications.vgg16 import VGG16 as VGG16
 from keras.src.applications.vgg19 import VGG19 as VGG19
 from keras.src.applications.xception import Xception as Xception

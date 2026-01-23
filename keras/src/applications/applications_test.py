@@ -18,6 +18,7 @@ from keras.src.applications import mobilenet_v3
 from keras.src.applications import nasnet
 from keras.src.applications import resnet
 from keras.src.applications import resnet_v2
+from keras.src.applications import unet
 from keras.src.applications import vgg16
 from keras.src.applications import vgg19
 from keras.src.applications import xception
@@ -292,3 +293,250 @@ class ApplicationsTest(testing.TestCase):
         )
         last_layer_act = model.layers[-1].activation.__name__
         self.assertEqual(last_layer_act, "softmax")
+
+
+@pytest.mark.skipif(
+    os.environ.get("SKIP_APPLICATIONS_TESTS"),
+    reason="Env variable set to skip.",
+)
+@pytest.mark.requires_trainable_backend
+class UNetTest(testing.TestCase):
+    """Test suite specifically for U-Net model."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.original_image_data_format = backend.image_data_format()
+
+    @classmethod
+    def tearDownClass(cls):
+        backend.set_image_data_format(cls.original_image_data_format)
+
+    def test_unet_basic_instantiation(self):
+        """Test basic UNet instantiation with default parameters."""
+        model = unet.UNet(weights=None, include_top=True)
+        self.assertIsNotNone(model)
+        # UNet preserves spatial dimensions, so with default None input size
+        # the output spatial dims are also None
+        self.assertEqual(model.output_shape[-1], 1)
+
+    def test_unet_custom_input_shape(self):
+        """Test UNet with custom input shape."""
+        backend.set_image_data_format("channels_last")
+        model = unet.UNet(
+            weights=None, include_top=True, input_shape=(128, 128, 3)
+        )
+        self.assertEqual(model.output_shape, (None, 128, 128, 1))
+
+    def test_unet_custom_classes(self):
+        """Test UNet with custom number of output classes."""
+        backend.set_image_data_format("channels_last")
+        model = unet.UNet(
+            weights=None, include_top=True, classes=3, input_shape=(128, 128, 3)
+        )
+        self.assertEqual(model.output_shape, (None, 128, 128, 3))
+
+    def test_unet_notop(self):
+        """Test UNet without top layer."""
+        backend.set_image_data_format("channels_last")
+        model = unet.UNet(
+            weights=None, include_top=False, input_shape=(128, 128, 3)
+        )
+        # Output should be from last decoder block, not a single channel
+        self.assertEqual(model.output_shape[0], None)
+        self.assertEqual(model.output_shape[1:3], (128, 128))
+
+    def test_unet_notop_with_pooling(self):
+        """Test UNet without top but with pooling."""
+        backend.set_image_data_format("channels_last")
+        model = unet.UNet(
+            weights=None,
+            include_top=False,
+            input_shape=(128, 128, 3),
+            pooling="avg",
+        )
+        # With pooling, output should be 2D
+        self.assertEqual(len(model.output_shape), 2)
+        self.assertEqual(model.output_shape[0], None)
+
+    def test_unet_custom_depth(self):
+        """Test UNet with custom depth."""
+        backend.set_image_data_format("channels_last")
+        model = unet.UNet(
+            weights=None,
+            include_top=True,
+            input_shape=(128, 128, 3),
+            depth=4,
+        )
+        self.assertIsNotNone(model)
+
+    def test_unet_custom_base_filters(self):
+        """Test UNet with custom base filters."""
+        backend.set_image_data_format("channels_last")
+        model = unet.UNet(
+            weights=None,
+            include_top=True,
+            input_shape=(128, 128, 3),
+            base_filters=32,
+        )
+        self.assertIsNotNone(model)
+
+    def test_unet_channels_first(self):
+        """Test UNet with channels_first data format."""
+        backend.set_image_data_format("channels_first")
+        model = unet.UNet(
+            weights=None, include_top=True, input_shape=(3, 128, 128)
+        )
+        self.assertEqual(model.output_shape, (None, 1, 128, 128))
+        backend.set_image_data_format("channels_last")
+
+    def test_unet_preprocess_input(self):
+        """Test UNet preprocess_input function."""
+        x = np.random.random((1, 128, 128, 3))
+        processed = unet.preprocess_input(x)
+        self.assertEqual(processed.shape, x.shape)
+
+    def test_unet_serialization(self):
+        """Test UNet model serialization."""
+        backend.set_image_data_format("channels_last")
+        model = unet.UNet(
+            weights=None, include_top=True, input_shape=(128, 128, 3)
+        )
+        config = serialization_lib.serialize_keras_object(model)
+        reconstructed_model = serialization_lib.deserialize_keras_object(config)
+        self.assertEqual(len(model.weights), len(reconstructed_model.weights))
+
+    def test_unet_training_inference(self):
+        """Test UNet training and inference with different batch sizes."""
+        backend.set_image_data_format("channels_last")
+
+        # Create model
+        model = unet.UNet(
+            weights=None, include_top=True, input_shape=(128, 128, 3), classes=1
+        )
+        model.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
+
+        # Generate dummy training data
+        batch_sizes = [1, 2, 4]
+        num_samples = 8
+
+        for batch_size in batch_sizes:
+            print(f"\nTesting with batch size {batch_size}")
+
+            # Create dummy data
+            x_train = np.random.random((num_samples, 128, 128, 3)).astype(np.float32)
+            y_train = np.random.randint(0, 2, (num_samples, 128, 128, 1)).astype(np.float32)
+
+            # Train for 2-3 epochs
+            history = model.fit(
+                x_train, y_train,
+                batch_size=batch_size,
+                epochs=2,
+                verbose=0,
+                validation_split=0.2
+            )
+
+            # Verify training worked
+            self.assertIn("loss", history.history)
+            self.assertIn("accuracy", history.history)
+            self.assertLess(history.history["loss"][-1], history.history["loss"][0])  # Loss should decrease
+
+            # Test inference
+            x_test = np.random.random((batch_size, 128, 128, 3)).astype(np.float32)
+            predictions = model.predict(x_test, verbose=0, batch_size=batch_size)
+
+            # Verify predictions
+            self.assertEqual(predictions.shape, (batch_size, 128, 128, 1))
+            self.assertTrue(np.all(predictions >= 0) and np.all(predictions <= 1))  # Sigmoid output
+
+            print(f"✓ Batch size {batch_size}: loss decreased from {history.history['loss'][0]:.4f} to {history.history['loss'][-1]:.4f}")
+
+    def test_unet_training_different_classes(self):
+        """Test UNet training with multiple classes."""
+        backend.set_image_data_format("channels_last")
+
+        # Test with 3 classes
+        model = unet.UNet(
+            weights=None, include_top=True, input_shape=(128, 128, 3), classes=3
+        )
+        model.compile(optimizer="adam", loss="categorical_crossentropy", metrics=["accuracy"])
+
+        # Generate dummy data
+        num_samples = 8
+        x_train = np.random.random((num_samples, 128, 128, 3)).astype(np.float32)
+        y_train = np.random.random((num_samples, 128, 128, 3)).astype(np.float32)  # Random multiclass targets
+
+        # Train
+        history = model.fit(x_train, y_train, batch_size=2, epochs=2, verbose=0)
+
+        # Verify
+        self.assertIn("loss", history.history)
+        self.assertLess(history.history["loss"][-1], history.history["loss"][0])
+
+        # Test inference
+        predictions = model.predict(x_train[:2], verbose=0)
+        self.assertEqual(predictions.shape, (2, 128, 128, 3))
+
+    def test_unet_inference_loops(self):
+        """Test UNet inference with multiple loops and different input sizes."""
+        backend.set_image_data_format("channels_last")
+
+        model = unet.UNet(weights=None, include_top=True, input_shape=(128, 128, 3))
+
+        # Test different input sizes that are powers of 2
+        input_sizes = [(64, 64), (128, 128), (256, 256)]
+
+        for height, width in input_sizes:
+            print(f"\nTesting inference with input size {height}x{width}")
+
+            # Create model for this size (since UNet preserves spatial dims)
+            test_model = unet.UNet(
+                weights=None, include_top=True, input_shape=(height, width, 3)
+            )
+
+            # Run multiple inference loops
+            for loop in range(3):
+                x = np.random.random((2, height, width, 3)).astype(np.float32)
+                y = test_model.predict(x, verbose=0)
+
+                self.assertEqual(y.shape, (2, height, width, 1))
+                print(f"✓ Loop {loop + 1}: output shape {y.shape}")
+
+    def test_unet_training_validation(self):
+        """Test UNet training with validation and metrics monitoring."""
+        backend.set_image_data_format("channels_last")
+
+        model = unet.UNet(
+            weights=None, include_top=True, input_shape=(128, 128, 3), classes=1
+        )
+        model.compile(
+            optimizer="adam",
+            loss="binary_crossentropy",
+            metrics=["accuracy", "precision", "recall"]
+        )
+
+        # Generate larger dataset
+        num_samples = 32  # Increased dataset size
+        x_data = np.random.random((num_samples, 128, 128, 3)).astype(np.float32)
+        y_data = np.random.randint(0, 2, (num_samples, 128, 128, 1)).astype(np.float32)
+
+        # Train with validation
+        history = model.fit(
+            x_data, y_data,
+            batch_size=4,
+            epochs=5,  # Increased epochs
+            verbose=0,
+            validation_split=0.3
+        )
+
+        # Verify all metrics are present
+        required_metrics = ["loss", "accuracy", "precision", "recall"]
+        for metric in required_metrics:
+            self.assertIn(metric, history.history)
+            self.assertIn(f"val_{metric}", history.history)
+
+        # Verify loss decreased (allow for some fluctuation in validation)
+        self.assertLess(history.history["loss"][-1], history.history["loss"][0])
+        # For validation loss, just check it's reasonable (not checking strict decrease due to random data)
+        self.assertGreater(history.history["val_loss"][-1], 0.0)
+
+        print(f"✓ Training completed: final loss {history.history['loss'][-1]:.4f}, val_loss {history.history['val_loss'][-1]:.4f}")
