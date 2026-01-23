@@ -1,5 +1,6 @@
 from keras.src import backend
 from keras.src import layers
+from keras.src import ops
 from keras.src.api_export import keras_export
 from keras.src.applications import imagenet_utils
 from keras.src.models import Functional
@@ -83,7 +84,8 @@ def _decoder_block(x, skip, filters, name):
         padding="same",
         name=f"{name}_upsample",
     )(x)
-    # Concatenate along channel axis (axis=1 for channels_first, axis=-1 for channels_last)
+    # Concatenate along channel axis
+    # (axis=1 for channels_first, axis=-1 for channels_last)
     if backend.image_data_format() == "channels_first":
         concat_axis = 1
     else:
@@ -101,8 +103,8 @@ def UNet(
     input_tensor=None,
     input_shape=None,
     pooling=None,
-    classes=1,
-    classifier_activation="sigmoid",
+    classes=2,
+    classifier_activation="softmax",
     name="unet",
     depth=5,
     base_filters=64,
@@ -143,18 +145,23 @@ def UNet(
                 model will be a 2D tensor.
             - `max` means that global max pooling will be applied.
         classes: Optional number of classes or output channels to segment,
-            only to be specified if `include_top` is `True`. Defaults to 1
-            for binary segmentation.
+            only to be specified if `include_top` is `True`. Defaults to 2
+            (background and foreground for binary segmentation).
         classifier_activation: A `str` or callable. The activation function to
             use on the "top" layer. Ignored unless `include_top=True`. Set
             `classifier_activation=None` to return the logits of the "top"
-            layer. Defaults to `"sigmoid"`.
+            layer. Defaults to `"softmax"`.
         name: The name of the model (string).
         depth: The depth of the U-Net (number of encoder/decoder blocks).
             Defaults to 5 (as in the original paper).
         base_filters: Number of filters in the first encoder block. Each
             subsequent encoder block doubles the number of filters. Defaults
             to 64.
+
+    Note: each Keras Application expects a specific kind of input preprocessing.
+    For UNet, call `keras.applications.unet.preprocess_input` on your
+    inputs before passing them to the model. `unet.preprocess_input` will
+    scale input pixels between 0 and 1.
 
     Returns:
         A `Model` instance.
@@ -262,13 +269,37 @@ def preprocess_input(x, data_format=None):
     Returns:
         Preprocessed tensor or Numpy array.
     """
-    return imagenet_utils.preprocess_input(
-        x, data_format=data_format, mode="torch"
-    )
+    if data_format is None:
+        data_format = backend.image_data_format()
+    elif data_format not in {"channels_first", "channels_last"}:
+        raise ValueError(
+            "Expected data_format to be one of `channels_first` or "
+            f"`channels_last`. Received: data_format={data_format}"
+        )
+
+    x = ops.cast(x, "float32")
+    x = x / 255.0
+    return x
 
 
-preprocess_input.__doc__ = imagenet_utils.PREPROCESS_INPUT_DOC.format(
-    mode="",
-    ret=imagenet_utils.PREPROCESS_INPUT_RET_DOC_TORCH,
-    error=imagenet_utils.PREPROCESS_INPUT_ERROR_DOC,
-)
+preprocess_input.__doc__ = """
+Preprocesses a tensor or Numpy array encoding a batch of images.
+
+Args:
+    x: A floating point `numpy.array` or a backend-native tensor,
+        3D or 4D with 3 color channels, with values in the range [0, 255].
+        The preprocessed data are written over the input data
+        if the data types are compatible. To avoid this
+        behaviour, `numpy.copy(x)` can be used.
+    data_format: Optional data format of the image tensor/array. None, means
+        the global setting `keras.backend.image_data_format()` is used
+        (unless you changed it, it uses "channels_last").
+        Defaults to `None`.
+
+Returns:
+    Preprocessed array with type `float32`.
+    The inputs pixel values are scaled between 0 and 1, sample-wise.
+
+Raises:
+    ValueError: In case of unknown `data_format` argument.
+"""
