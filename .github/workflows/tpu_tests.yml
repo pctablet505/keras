@@ -1,15 +1,10 @@
-name: Keras Tests
-
-# TODO: Consider enabling all tests (pytest, applications, etc.) with NNX in the future
-# Currently only basic flow tests run with NNX enabled
+name: Keras TPU Tests
 
 on:
   push:
-    branches: [ master ]
+    branches: [master]
   pull_request:
-    types: [labeled]
-  pull_request_review:
-    types: [submitted]
+    types: [unlabeled]
   release:
     types: [created]
 
@@ -21,12 +16,11 @@ jobs:
   test-in-container:
     name: Run tests on TPU
     runs-on: linux-x86-ct6e-44-1tpu
-    # Only run on approved PRs, pushes to master, releases or "run_tpu_tests" labels
+    # Only run on pushes to master, releases or "kokoro:force-run" unlabel
     if: |
       github.event_name == 'push' ||
       github.event_name == 'release' ||
-      (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name == 'run_tpu_tests') ||
-      (github.event_name == 'pull_request_review' && github.event.review.state == 'approved')
+      (github.event_name == 'pull_request' && github.event.action == 'unlabeled' && github.event.label.name == 'kokoro:force-run')
 
     strategy:
       fail-fast: false
@@ -39,21 +33,16 @@ jobs:
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6.0.1
       
       - name: Install Dependencies
-        run: |
-          pip install --no-cache-dir -r requirements-${{ matrix.backend }}-tpu.txt \
+        run: pip install --no-cache-dir -r requirements-${{ matrix.backend }}-tpu.txt
       
       - name: Set Keras Backend
         run: echo "KERAS_BACKEND=jax" >> $GITHUB_ENV
 
-      - name: Run Verification and Tests
-        run: |
-          echo "Successfully running inside the public python container!"
-          echo "Verifying JAX installation..."
-          python3 -c "import jax; print(f'JAX backend: {jax.default_backend()}'); print(f'JAX devices : {jax.devices()}')"
+      - name: Verify JAX Installation
+        run: python3 -c "import jax; print('JAX devices:', jax.devices()); assert jax.default_backend() == 'tpu'"
 
-          pytest keras --ignore keras/src/applications \
-                      --cov=keras \
-                      --cov-config=pyproject.toml
+      - name: Run Tests
+        run: pytest keras --ignore keras/src/applications --cov=keras --cov-config=pyproject.toml

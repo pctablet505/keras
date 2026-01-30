@@ -129,8 +129,13 @@ from keras.src.ops.numpy import mod as mod
 from keras.src.ops.numpy import moveaxis as moveaxis
 from keras.src.ops.numpy import multiply as multiply
 from keras.src.ops.numpy import nan_to_num as nan_to_num
+from keras.src.ops.numpy import nanmax as nanmax
+from keras.src.ops.numpy import nanmean as nanmean
+from keras.src.ops.numpy import nanmin as nanmin
+from keras.src.ops.numpy import nansum as nansum
 from keras.src.ops.numpy import ndim as ndim
 from keras.src.ops.numpy import negative as negative
+from keras.src.ops.numpy import nextafter as nextafter
 from keras.src.ops.numpy import nonzero as nonzero
 from keras.src.ops.numpy import not_equal as not_equal
 from keras.src.ops.numpy import ones as ones
@@ -139,6 +144,7 @@ from keras.src.ops.numpy import outer as outer
 from keras.src.ops.numpy import pad as pad
 from keras.src.ops.numpy import power as power
 from keras.src.ops.numpy import prod as prod
+from keras.src.ops.numpy import ptp as ptp
 from keras.src.ops.numpy import quantile as quantile
 from keras.src.ops.numpy import ravel as ravel
 from keras.src.ops.numpy import real as real
@@ -182,6 +188,7 @@ from keras.src.ops.numpy import triu as triu
 from keras.src.ops.numpy import true_divide as true_divide
 from keras.src.ops.numpy import trunc as trunc
 from keras.src.ops.numpy import unravel_index as unravel_index
+from keras.src.ops.numpy import vander as vander
 from keras.src.ops.numpy import var as var
 from keras.src.ops.numpy import vdot as vdot
 from keras.src.ops.numpy import vectorize as vectorize

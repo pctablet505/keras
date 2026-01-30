@@ -1,4 +1,4 @@
-import sys
+import math
 
 import numpy as np
 import pytest
@@ -19,7 +19,7 @@ from keras.src.testing.test_utils import named_product
 
 class QuantizersTest(testing.TestCase):
     def test_get_method(self):
-        quantizer = quantizers.get("abs_max_quantizer", axis=-1)
+        quantizer = quantizers.get("abs_max_quantizer")
         self.assertTrue(quantizer, quantizers.AbsMaxQuantizer)
 
         quantizer = quantizers.get(None)
@@ -30,10 +30,10 @@ class QuantizersTest(testing.TestCase):
 
     def test_abs_max_quantizer(self):
         values = random.uniform([3, 4, 5], minval=-1, maxval=1, dtype="float32")
-        quantizer = quantizers.AbsMaxQuantizer(axis=-1)
+        quantizer = quantizers.AbsMaxQuantizer()
 
         # Test quantizing
-        quantized_values, scale = quantizer(values)
+        quantized_values, scale = quantizer(values, axis=-1)
         self.assertDType(quantized_values, "int8")
         self.assertDType(scale, "float32")
         self.assertEqual(tuple(quantized_values.shape), (3, 4, 5))
@@ -55,11 +55,11 @@ class QuantizersTest(testing.TestCase):
         values = random.uniform(
             [3, 4, 5], minval=-1, maxval=1, dtype="bfloat16"
         )
-        quantized_values, scale = quantizer(values)
+        quantized_values, scale = quantizer(values, axis=-1)
         self.assertDType(quantized_values, "int8")
         self.assertDType(scale, "bfloat16")
         values = random.uniform([3, 4, 5], minval=-1, maxval=1, dtype="float16")
-        quantized_values, scale = quantizer(values)
+        quantized_values, scale = quantizer(values, axis=-1)
         self.assertDType(quantized_values, "int8")
         self.assertDType(scale, "float16")
 
@@ -194,6 +194,19 @@ class QuantizersTest(testing.TestCase):
                 "narrow_range": False,
                 "input_mins": [0.0],
                 "input_maxs": [255.0],
+                "num_bits": 8,
+                "expected_nudged_input_mins": [0.0],
+                "expected_nudged_input_maxs": [255.0],
+                "expected_steps": [1.0],
+                "axis": None,
+            },
+            {
+                "testcase_name": (
+                    "wide_8bits_scalar_input_mins_0.0_input_maxs_255.0"
+                ),
+                "narrow_range": False,
+                "input_mins": 0.0,
+                "input_maxs": 255.0,
                 "num_bits": 8,
                 "expected_nudged_input_mins": [0.0],
                 "expected_nudged_input_maxs": [255.0],
@@ -432,7 +445,7 @@ class QuantizersTest(testing.TestCase):
         expected_nudged_input_maxs,
         expected_steps,
     ):
-        num_channels = len(input_mins)
+        num_channels = len(expected_nudged_input_mins)
         inputs_list = []
         expected_list = []
         initial_gradients_list = []
@@ -538,19 +551,18 @@ class QuantizersTest(testing.TestCase):
             ):
                 # Define the function to compute gradients for
                 def quantize_fn(x):
-                    return quantizers.fake_quant_with_min_max_vars(
-                        x, input_mins, input_maxs, num_bits, narrow_range, axis
+                    return ops.sum(
+                        quantizers.fake_quant_with_min_max_vars(
+                            x,
+                            input_mins,
+                            input_maxs,
+                            num_bits,
+                            narrow_range,
+                            axis,
+                        )
                     )
 
-                _, f_vjp = jax.vjp(quantize_fn, inputs)
-
-                if getattr(jax.config, "jax_vjp3", False):
-                    input_gradients = f_vjp.opaque_residuals[0]
-                elif sys.version_info >= (3, 10):
-                    input_gradients = f_vjp.args[0].args[0][0]
-                else:
-                    input_gradients = f_vjp.args[0].args[0][1]
-
+                input_gradients = jax.grad(quantize_fn)(inputs)
                 return ops.multiply(initial_gradients, input_gradients)
 
         gradients = test_op(
@@ -594,6 +606,217 @@ class QuantizersTest(testing.TestCase):
         )
         self.assertDType(outputs, "float16")
         self.assertAllClose(outputs, expected)
+
+    @parameterized.named_parameters(
+        ("block_32", 32),
+        ("block_64", 64),
+        ("block_128", 128),
+    )
+    def test_grouped_quantize_dequantize_roundtrip(self, block_size):
+        """Test that grouped quantize/dequantize has low error."""
+        input_dim, output_dim = 256, 128
+        kernel = random.uniform(
+            (input_dim, output_dim), minval=-1, maxval=1, dtype="float32"
+        )
+
+        quantized, scale, zero = (
+            quantizers.abs_max_quantize_grouped_with_zero_point(
+                kernel,
+                block_size=block_size,
+                value_range=(-8, 7),
+                dtype="int8",
+            )
+        )
+
+        # Use dequantize_with_sz_map with generated g_idx
+        g_idx = ops.arange(input_dim) // block_size
+        dequantized = ops.transpose(
+            quantizers.dequantize_with_sz_map(
+                ops.transpose(ops.cast(quantized, scale.dtype)),
+                ops.transpose(scale),
+                ops.transpose(zero),
+                g_idx,
+            )
+        )
+
+        rmse = ops.sqrt(ops.mean(ops.square(kernel - dequantized)))
+        # Grouped quantization should have reasonable error
+        self.assertLess(rmse, 0.15)
+
+    def test_grouped_quantize_with_padding(self):
+        """Test grouped quantization when input_dim is not divisible."""
+
+        # 500 is not divisible by 128, so padding will be needed
+        input_dim, output_dim, block_size = 500, 256, 128
+        kernel = random.uniform(
+            (input_dim, output_dim), minval=-1, maxval=1, dtype="float32"
+        )
+
+        quantized, scale, zero = (
+            quantizers.abs_max_quantize_grouped_with_zero_point(
+                kernel,
+                block_size=block_size,
+                value_range=(-8, 7),
+                dtype="int8",
+            )
+        )
+
+        n_groups = math.ceil(input_dim / block_size)  # 4 groups
+        self.assertEqual(quantized.shape, (input_dim, output_dim))
+        self.assertEqual(scale.shape, (n_groups, output_dim))
+        self.assertEqual(zero.shape, (n_groups, output_dim))
+
+    def test_grouped_vs_perchannel_accuracy(self):
+        """Test that grouped quantization has lower error than per-channel."""
+        input_dim, output_dim, block_size = 512, 256, 128
+        # Use a specific seed for reproducibility
+        kernel = random.uniform(
+            (input_dim, output_dim),
+            minval=-1,
+            maxval=1,
+            dtype="float32",
+            seed=42,
+        )
+
+        # Per-channel quantization (one scale per output channel)
+        quantizer = quantizers.AbsMaxQuantizer(
+            axis=0, value_range=(-8, 7), output_dtype="int8"
+        )
+        pc_quantized, pc_scale = quantizer(kernel)
+        pc_dequantized = ops.cast(pc_quantized, "float32") / pc_scale
+        pc_rmse = ops.sqrt(ops.mean(ops.square(kernel - pc_dequantized)))
+
+        # Grouped (sub-channel) quantization with zero point
+        grouped_quantized, grouped_scale, grouped_zero = (
+            quantizers.abs_max_quantize_grouped_with_zero_point(
+                kernel, block_size=block_size, value_range=(-8, 7), dtype="int8"
+            )
+        )
+
+        # Use dequantize_with_sz_map with generated g_idx
+        g_idx = ops.arange(input_dim) // block_size
+        grouped_dequantized = ops.transpose(
+            quantizers.dequantize_with_sz_map(
+                ops.transpose(ops.cast(grouped_quantized, grouped_scale.dtype)),
+                ops.transpose(grouped_scale),
+                ops.transpose(grouped_zero),
+                g_idx,
+            )
+        )
+
+        grouped_rmse = ops.sqrt(
+            ops.mean(ops.square(kernel - grouped_dequantized))
+        )
+
+        # Grouped should have lower or similar error
+        # (in most cases it should be lower due to finer granularity)
+        self.assertLessEqual(float(grouped_rmse), float(pc_rmse) + 0.01)
+
+    def test_grouped_quantize_various_block_sizes(self):
+        """Test grouped quantization with various block sizes."""
+
+        input_dim, output_dim = 512, 128
+        kernel = random.uniform(
+            (input_dim, output_dim), minval=-1, maxval=1, dtype="float32"
+        )
+
+        for block_size in [32, 64, 128, 256]:
+            quantized, scale, zero = (
+                quantizers.abs_max_quantize_grouped_with_zero_point(
+                    kernel,
+                    block_size=block_size,
+                    value_range=(-8, 7),
+                    dtype="int8",
+                )
+            )
+
+            n_groups = math.ceil(input_dim / block_size)
+            self.assertEqual(quantized.shape, (input_dim, output_dim))
+            self.assertEqual(scale.shape, (n_groups, output_dim))
+            self.assertEqual(zero.shape, (n_groups, output_dim))
+
+
+class Int4QuantizationConfigTest(testing.TestCase):
+    def test_default_block_size(self):
+        """Test that default block_size is 128."""
+        from keras.src.quantizers import Int4QuantizationConfig
+
+        config = Int4QuantizationConfig()
+        self.assertEqual(config.block_size, 128)
+        self.assertEqual(config.mode, "int4")
+
+    @parameterized.named_parameters(
+        ("block_32", 32),
+        ("block_64", 64),
+        ("block_128", 128),
+        ("block_256", 256),
+    )
+    def test_custom_block_size(self, block_size):
+        """Test setting custom block_size values."""
+        from keras.src.quantizers import Int4QuantizationConfig
+
+        config = Int4QuantizationConfig(block_size=block_size)
+        self.assertEqual(config.block_size, block_size)
+
+    def test_per_channel_mode_with_none(self):
+        """Test per-channel mode with block_size=None."""
+        from keras.src.quantizers import Int4QuantizationConfig
+
+        config = Int4QuantizationConfig(block_size=None)
+        self.assertIsNone(config.block_size)
+
+    def test_per_channel_mode_with_negative_one(self):
+        """Test per-channel mode with block_size=-1."""
+        from keras.src.quantizers import Int4QuantizationConfig
+
+        config = Int4QuantizationConfig(block_size=-1)
+        self.assertEqual(config.block_size, -1)
+
+    def test_invalid_block_size_raises(self):
+        """Test that invalid block_size values raise ValueError."""
+        from keras.src.quantizers import Int4QuantizationConfig
+
+        with self.assertRaisesRegex(ValueError, "block_size must be"):
+            Int4QuantizationConfig(block_size=0)
+
+        with self.assertRaisesRegex(ValueError, "block_size must be"):
+            Int4QuantizationConfig(block_size=-2)
+
+    def test_get_config_includes_block_size(self):
+        """Test that get_config includes block_size."""
+        from keras.src.quantizers import Int4QuantizationConfig
+
+        config = Int4QuantizationConfig(block_size=64)
+        serialized = config.get_config()
+        self.assertEqual(serialized["block_size"], 64)
+
+    def test_from_config_restores_block_size(self):
+        """Test that from_config restores block_size."""
+        from keras.src.quantizers import Int4QuantizationConfig
+
+        original = Int4QuantizationConfig(block_size=64)
+        serialized = original.get_config()
+        restored = Int4QuantizationConfig.from_config(serialized)
+        self.assertEqual(restored.block_size, 64)
+
+    def test_serialization_roundtrip(self):
+        """Test full serialization roundtrip."""
+        from keras.src.quantizers import Int4QuantizationConfig
+
+        config = Int4QuantizationConfig(block_size=128)
+        serialized = quantizers.serialize(config)
+        deserialized = quantizers.deserialize(serialized)
+        self.assertEqual(deserialized.block_size, 128)
+        self.assertEqual(deserialized.mode, "int4")
+
+    def test_serialization_with_per_channel(self):
+        """Test serialization with per-channel mode."""
+        from keras.src.quantizers import Int4QuantizationConfig
+
+        config = Int4QuantizationConfig(block_size=None)
+        serialized = quantizers.serialize(config)
+        deserialized = quantizers.deserialize(serialized)
+        self.assertIsNone(deserialized.block_size)
 
 
 class GPTQQuantizerTest(testing.TestCase):
@@ -690,14 +913,14 @@ class ComputeScaleZeroTest(testing.TestCase):
             compute_quantization_parameters(None, bits=4)
 
     def test_error_when_x_is_empty(self):
-        x = ops.array([], "float32")
+        x = ops.array([[], []], "float32")  # 2D empty tensor
         with self.assertRaisesRegex(ValueError, "cannot be empty"):
             compute_quantization_parameters(x, bits=4)
 
     def test_error_when_weight_rank_too_low(self):
         x = ops.array([1.0, 2.0], "float32")  # rank-1
         with self.assertRaisesRegex(ValueError, "rank of at least 2"):
-            compute_quantization_parameters(x, bits=4, weight=True)
+            compute_quantization_parameters(x, bits=4)
 
     @parameterized.named_parameters(
         ("bits2_asym", 2, False),
@@ -713,35 +936,31 @@ class ComputeScaleZeroTest(testing.TestCase):
             np.random.default_rng(0).standard_normal((7, 5), dtype="float32")
         )
         scale, zero, maxq = compute_quantization_parameters(
-            x, bits=bits, symmetric=symmetric, per_channel=False, weight=False
+            x, bits=bits, symmetric=symmetric, per_channel=False
         )
 
-        # Shapes (per-tensor): (1,) for scale/zero
-        self.assertEqual(scale.shape, (1,))
-        self.assertEqual(zero.shape, (1,))
+        # Shapes (per-tensor with weight semantics): (out_features, 1)
+        self.assertEqual(scale.shape, (7, 1))
+        self.assertEqual(zero.shape, (7, 1))
 
         # Scale must be strictly positive
         self.assertTrue(ops.all(scale > 0.0))
 
-        if symmetric:
-            # zero should be (maxq + 1)/2 for symmetric
-            expected_zero = ops.divide(ops.add(maxq, 1.0), 2.0)
-            self.assertAllClose(zero, expected_zero)
-        else:
-            # Asymmetric: zero ~ round(-min/scale) on the flattened input
-            flat = ops.reshape(x, (1, -1))
-            min_val = ops.min(flat, axis=1)
-            expected_zero = ops.round(ops.divide(ops.negative(min_val), scale))
-            self.assertAllClose(zero, expected_zero)
+        # All elements in the scale and zero tensors must be equal due to
+        # tiling for per-tensor quantization
+        self.assertTrue(ops.all(scale == scale[0, 0]))
+        self.assertTrue(ops.all(zero == zero[0, 0]))
 
     def test_per_tensor_symmetric_on_constant_input_uses_safe_range(self):
         """Ensures safe range adjustment if entries are equal"""
         x = ops.array(np.full((3, 4), 0.0, dtype=np.float32))
         scale, zero, maxq = compute_quantization_parameters(
-            x, bits=4, symmetric=True, per_channel=False, weight=False
+            x, bits=4, symmetric=True, per_channel=False
         )
         # With symmetric=True and constant input, zero = (maxq+1)/2
-        self.assertAllClose(zero, ops.array((float(maxq) + 1.0) / 2.0))
+        # Shape is now (3, 1) due to weight semantics
+        expected_zero = ops.array((float(maxq) + 1.0) / 2.0)
+        self.assertAllClose(zero[0, 0], expected_zero)
         self.assertTrue(ops.all(ops.greater(scale, 0.0)))
 
     def test_weight_per_tensor_tiles_rows(self):
@@ -751,9 +970,9 @@ class ComputeScaleZeroTest(testing.TestCase):
             np.random.default_rng(1).standard_normal((8, 16)), "float32"
         )
         scale, zero, _ = compute_quantization_parameters(
-            x, bits=4, symmetric=False, per_channel=False, weight=True
+            x, bits=4, symmetric=False, per_channel=False
         )
-        # When weight=True and per_channel=False, shapes are (rows, 1)
+        # With per_channel=False, shapes are (rows, 1)
         self.assertEqual(scale.shape, (8, 1))
         self.assertEqual(zero.shape, (8, 1))
 
@@ -774,7 +993,6 @@ class ComputeScaleZeroTest(testing.TestCase):
             symmetric=False,
             per_channel=True,
             group_size=-1,
-            weight=True,
         )
         # Per-channel (ungrouped): one scale per output row -> (rows, 1)
         self.assertEqual(scale.shape, (6, 1))
@@ -788,23 +1006,24 @@ class ComputeScaleZeroTest(testing.TestCase):
     def test_weight_per_channel_grouped_shapes_and_count(self):
         """Tests that scales/zeros have the correct shape and count when
         per-channel quantization is used with grouping."""
-        rows, cols, groups = 8, 16, 4
+        out_features, in_features, group_size = 8, 16, 4
         x = ops.array(
-            np.random.default_rng(3).standard_normal((rows, cols)), "float32"
+            np.random.default_rng(3).standard_normal(
+                (out_features, in_features)
+            ),
+            "float32",
         )
         scale, zero, _ = compute_quantization_parameters(
             x,
             bits=4,
             symmetric=False,
             per_channel=True,
-            group_size=groups,
-            weight=True,
+            group_size=group_size,
         )
-        # Grouped path reshapes to [-1, group_size]
-        # number of groups = rows*cols / groups
-        num_groups = (rows * cols) // groups
-        self.assertEqual(scale.shape, (num_groups, 1))
-        self.assertEqual(zero.shape, (num_groups, 1))
+        # Grouped path produces [out_features, n_groups] shape
+        n_groups = in_features // group_size
+        self.assertEqual(scale.shape, (out_features, n_groups))
+        self.assertEqual(zero.shape, (out_features, n_groups))
         self.assertTrue(ops.all(ops.greater(scale, 0.0)))
 
     @parameterized.named_parameters(
@@ -821,7 +1040,6 @@ class ComputeScaleZeroTest(testing.TestCase):
             symmetric=symmetric,
             per_channel=True,
             group_size=-1,
-            weight=True,
         )
         # All outputs should be all finite
         self.assertTrue(ops.all(ops.isfinite(scale)))
@@ -929,3 +1147,125 @@ class ComputeScaleZeroTest(testing.TestCase):
                 expected_quantized[i, j] = ops.cast(q_val_clipped, "uint8")
 
         self.assertAllClose(quantized_result, expected_quantized)
+
+
+class GroupedQuantizationParametersTest(testing.TestCase):
+    """Test grouped weight quantization in compute_quantization_parameters."""
+
+    def test_grouped_weight_shapes_divisible(self):
+        """Test grouped quantization with divisible dimensions."""
+        out_features, in_features, group_size = 64, 128, 32
+        n_groups = in_features // group_size  # 4
+
+        x = ops.array(
+            np.random.randn(out_features, in_features).astype("float32")
+        )
+
+        scale, zero, maxq = compute_quantization_parameters(
+            x,
+            bits=4,
+            symmetric=False,
+            per_channel=True,
+            group_size=group_size,
+        )
+
+        self.assertEqual(scale.shape, (out_features, n_groups))
+        self.assertEqual(zero.shape, (out_features, n_groups))
+        self.assertEqual(float(maxq), 15.0)
+
+    def test_grouped_weight_shapes_non_divisible(self):
+        """Test grouped quantization with non-divisible dimensions."""
+        out_features, in_features, group_size = 32, 100, 32
+        n_groups = (in_features + group_size - 1) // group_size  # 4
+
+        x = ops.array(
+            np.random.randn(out_features, in_features).astype("float32")
+        )
+
+        scale, zero, maxq = compute_quantization_parameters(
+            x,
+            bits=4,
+            symmetric=False,
+            per_channel=True,
+            group_size=group_size,
+        )
+
+        self.assertEqual(scale.shape, (out_features, n_groups))
+        self.assertEqual(zero.shape, (out_features, n_groups))
+
+    def test_grouped_returns_3_values(self):
+        """Test that grouped quantization returns exactly 3 values."""
+        x = ops.array(np.random.randn(32, 64).astype("float32"))
+
+        result = compute_quantization_parameters(
+            x,
+            bits=4,
+            symmetric=False,
+            per_channel=True,
+            group_size=16,
+        )
+
+        # Should return exactly 3 values
+        self.assertEqual(len(result), 3)
+        scale, zero, maxq = result
+        self.assertEqual(scale.shape, (32, 4))
+        self.assertEqual(zero.shape, (32, 4))
+
+    def test_single_group_per_channel_semantics(self):
+        """Test that single group slice uses per-channel semantics."""
+        out_features, in_features = 32, 16
+        group_size = 16  # in_features == group_size
+
+        x = ops.array(
+            np.random.randn(out_features, in_features).astype("float32")
+        )
+
+        scale, zero, maxq = compute_quantization_parameters(
+            x,
+            bits=4,
+            symmetric=False,
+            per_channel=True,
+            group_size=group_size,
+        )
+
+        # Single group should produce per-channel output shape
+        # n_groups = 1, so shape is [out_features, 1]
+        self.assertEqual(scale.shape, (out_features, 1))
+        self.assertEqual(zero.shape, (out_features, 1))
+
+    def test_grouped_no_nan_inf(self):
+        """Test grouped quantization produces no NaN/Inf."""
+        x = ops.array(np.random.randn(64, 128).astype("float32"))
+
+        scale, zero, maxq = compute_quantization_parameters(
+            x,
+            bits=4,
+            per_channel=True,
+            group_size=32,
+        )
+
+        self.assertFalse(ops.any(ops.isnan(scale)))
+        self.assertFalse(ops.any(ops.isinf(scale)))
+
+    def test_grouped_various_group_sizes(self):
+        """Test grouped quantization with various group sizes."""
+        out_features, in_features = 64, 128
+
+        for group_size in [8, 16, 32, 64]:
+            n_groups = (in_features + group_size - 1) // group_size
+            x = ops.array(
+                np.random.randn(out_features, in_features).astype("float32")
+            )
+
+            scale, zero, maxq = compute_quantization_parameters(
+                x,
+                bits=4,
+                per_channel=True,
+                group_size=group_size,
+            )
+
+            self.assertEqual(
+                scale.shape,
+                (out_features, n_groups),
+                f"Failed for group_size={group_size}",
+            )

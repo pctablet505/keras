@@ -1272,6 +1272,66 @@ def moveaxis(x, source, destination):
     return torch.moveaxis(x, source=source, destination=destination)
 
 
+def nanmax(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+    if not torch.is_floating_point(x):
+        return torch.amax(x, dim=axis, keepdim=keepdims)
+
+    if axis == () or axis == []:
+        return x
+
+    x_clean = torch.where(torch.isnan(x), float("-inf"), x)
+    out = torch.amax(x_clean, dim=axis, keepdim=keepdims)
+
+    return torch.where(
+        torch.isnan(x).all(dim=axis, keepdim=keepdims),
+        torch.tensor(float("nan"), dtype=x.dtype, device=get_device()),
+        out,
+    )
+
+
+def nanmean(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+
+    if axis == () or axis == []:
+        return x
+
+    dtype = dtypes.result_type(standardize_dtype(x.dtype), float)
+    return torch.nanmean(cast(x, dtype), dim=axis, keepdim=keepdims)
+
+
+def nanmin(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+    if not torch.is_floating_point(x):
+        return torch.amin(x, dim=axis, keepdim=keepdims)
+
+    if axis == () or axis == []:
+        return x
+
+    x_clean = torch.where(torch.isnan(x), float("inf"), x)
+    out = torch.amin(x_clean, dim=axis, keepdim=keepdims)
+
+    return torch.where(
+        torch.isnan(x).all(dim=axis, keepdim=keepdims),
+        torch.tensor(float("nan"), dtype=x.dtype, device=get_device()),
+        out,
+    )
+
+
+def nansum(x, axis=None, keepdims=False):
+    if isinstance(x, (list, tuple)):
+        x = stack(x)
+    x = convert_to_tensor(x)
+    dtype = standardize_dtype(x.dtype)
+
+    if dtype in ("bool", "uint8", "int8", "int16"):
+        dtype = "int32"
+
+    if axis == () or axis == []:
+        return cast(torch.nan_to_num(x, nan=0), dtype)
+    return cast(torch.nansum(x, dim=axis, keepdim=keepdims), dtype)
+
+
 def nan_to_num(x, nan=0.0, posinf=None, neginf=None):
     x = convert_to_tensor(x)
     return torch.nan_to_num(x, nan=nan, posinf=posinf, neginf=neginf)
@@ -1380,6 +1440,18 @@ def prod(x, axis=None, keepdims=False, dtype=None):
             dtype,
         )
     return x
+
+
+def ptp(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+    if axis is None:
+        return x.max() - x.min()
+    elif axis == ():
+        return torch.zeros_like(x)
+    else:
+        return torch.amax(x, dim=axis, keepdim=keepdims) - torch.amin(
+            x, dim=axis, keepdim=keepdims
+        )
 
 
 def quantile(x, q, axis=None, method="linear", keepdims=False):
@@ -1793,6 +1865,16 @@ def negative(x):
     return torch.negative(x)
 
 
+def nextafter(x1, x2):
+    x1 = convert_to_tensor(x1)
+    x2 = convert_to_tensor(x2)
+
+    dtype = dtypes.result_type(x1.dtype, x2.dtype, float)
+    x1 = cast(x1, torch.float64)
+    x2 = cast(x2, torch.float64)
+    return cast(torch.nextafter(x1, x2), dtype)
+
+
 def square(x):
     x = convert_to_tensor(x)
     if standardize_dtype(x.dtype) == "bool":
@@ -1831,6 +1913,12 @@ def trapezoid(y, x=None, dx=1.0, axis=-1):
     else:
         dx = convert_to_tensor(dx)
         return torch.trapz(y, dx=dx, dim=axis)
+
+
+def vander(x, N=None, increasing=False):
+    x = convert_to_tensor(x)
+    result_dtype = dtypes.result_type(x.dtype)
+    return cast(torch.vander(x, N=N, increasing=increasing), result_dtype)
 
 
 def var(x, axis=None, keepdims=False):

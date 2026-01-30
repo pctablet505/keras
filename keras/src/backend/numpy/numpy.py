@@ -960,6 +960,30 @@ def moveaxis(x, source, destination):
     return np.moveaxis(x, source=source, destination=destination)
 
 
+def nanmax(x, axis=None, keepdims=False):
+    return np.nanmax(x, axis=axis, keepdims=keepdims)
+
+
+def nanmean(x, axis=None, keepdims=False):
+    dtype = dtypes.result_type(standardize_dtype(x.dtype), float)
+    return np.nanmean(x, axis=axis, keepdims=keepdims).astype(dtype)
+
+
+def nanmin(x, axis=None, keepdims=False):
+    return np.nanmin(x, axis=axis, keepdims=keepdims)
+
+
+def nansum(x, axis=None, keepdims=False):
+    axis = standardize_axis_for_numpy(axis)
+    dtype = standardize_dtype(x.dtype)
+
+    if dtype in ("bool", "int8", "int16"):
+        dtype = "int32"
+    elif dtype in ("uint8", "uint16"):
+        dtype = "uint32"
+    return np.nansum(x, axis=axis, keepdims=keepdims).astype(dtype)
+
+
 def nan_to_num(x, nan=0.0, posinf=None, neginf=None):
     return np.nan_to_num(x, nan=nan, posinf=posinf, neginf=neginf)
 
@@ -1016,6 +1040,10 @@ def prod(x, axis=None, keepdims=False, dtype=None):
         elif dtype in ("uint8", "uint16"):
             dtype = "uint32"
     return np.prod(x, axis=axis, keepdims=keepdims, dtype=dtype)
+
+
+def ptp(x, axis=None, keepdims=False):
+    return np.ptp(x, axis=axis, keepdims=keepdims)
 
 
 def quantile(x, q, axis=None, method="linear", keepdims=False):
@@ -1335,6 +1363,14 @@ def negative(x):
     return np.negative(x)
 
 
+def nextafter(x1, x2):
+    x1 = convert_to_tensor(x1)
+    x2 = convert_to_tensor(x2)
+    dtype = dtypes.result_type(x1.dtype, x2.dtype, float)
+
+    return np.nextafter(x1, x2).astype(dtype)
+
+
 def square(x):
     x = convert_to_tensor(x)
     if standardize_dtype(x.dtype) == "bool":
@@ -1370,6 +1406,14 @@ def trapezoid(y, x=None, dx=1.0, axis=-1):
         x = convert_to_tensor(x)
     dx = convert_to_tensor(dx)
     return np.trapezoid(y, x, dx=dx, axis=axis).astype(result_dtype)
+
+
+def vander(x, N=None, increasing=False):
+    x = convert_to_tensor(x)
+    result_dtype = dtypes.result_type(x.dtype)
+    compute_dtype = dtypes.result_type(x.dtype, config.floatx())
+    x = x.astype(compute_dtype)
+    return np.vander(x, N=N, increasing=increasing).astype(result_dtype)
 
 
 def var(x, axis=None, keepdims=False):

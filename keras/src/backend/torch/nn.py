@@ -458,6 +458,94 @@ def average_pool(
     return outputs
 
 
+def adaptive_average_pool(inputs, output_size, data_format=None):
+    """Adaptive average pooling(1D/2D/3D) with channels_last support."""
+    inputs = convert_to_tensor(inputs)
+    num_spatial_dims = inputs.ndim - 2
+
+    data_format = backend.standardize_data_format(data_format)
+    orig_format = data_format
+    if data_format == "channels_last":
+        inputs = _transpose_spatial_inputs(inputs)
+
+    if isinstance(output_size, int):
+        torch_output_size = (
+            output_size
+            if num_spatial_dims == 1
+            else (output_size,) * num_spatial_dims
+        )
+    else:
+        torch_output_size = standardize_tuple(
+            output_size, num_spatial_dims, "output_size"
+        )
+
+    if get_device() == "meta":
+        inputs = torch.empty(
+            size=inputs.shape, dtype=inputs.dtype, device="cpu"
+        )
+
+    if num_spatial_dims == 1:
+        outputs = tnn.adaptive_avg_pool1d(inputs, output_size=torch_output_size)
+    elif num_spatial_dims == 2:
+        outputs = tnn.adaptive_avg_pool2d(inputs, output_size=torch_output_size)
+    elif num_spatial_dims == 3:
+        outputs = tnn.adaptive_avg_pool3d(inputs, output_size=torch_output_size)
+    else:
+        raise ValueError(
+            "Inputs to adaptive average pooling must have ndim=3, 4 or 5, "
+            f"Received input shape: {inputs.shape}."
+        )
+
+    if orig_format == "channels_last":
+        outputs = _transpose_spatial_outputs(outputs)
+    return outputs
+
+
+def adaptive_max_pool(inputs, output_size, data_format=None):
+    """Adaptive max pooling(1D/2D/3D) with channels_last support."""
+    inputs = convert_to_tensor(inputs)
+    num_spatial_dims = inputs.ndim - 2
+
+    data_format = backend.standardize_data_format(data_format)
+    orig_format = data_format
+    if data_format == "channels_last":
+        inputs = _transpose_spatial_inputs(inputs)
+
+    if isinstance(output_size, int):
+        torch_output_size = (
+            output_size
+            if num_spatial_dims == 1
+            else (output_size,) * num_spatial_dims
+        )
+    else:
+        torch_output_size = standardize_tuple(
+            output_size, num_spatial_dims, "output_size"
+        )
+
+    if get_device() == "meta":
+        inputs = torch.empty(
+            size=inputs.shape, dtype=inputs.dtype, device="cpu"
+        )
+
+    if num_spatial_dims == 1:
+        res = tnn.adaptive_max_pool1d(inputs, output_size=torch_output_size)
+    elif num_spatial_dims == 2:
+        res = tnn.adaptive_max_pool2d(inputs, output_size=torch_output_size)
+    elif num_spatial_dims == 3:
+        res = tnn.adaptive_max_pool3d(inputs, output_size=torch_output_size)
+    else:
+        raise ValueError(
+            "Inputs to adaptive max pooling must have ndim=3, 4 or 5, "
+            f"Received input shape: {inputs.shape}."
+        )
+
+    outputs = res[0] if isinstance(res, tuple) else res
+
+    if orig_format == "channels_last":
+        outputs = _transpose_spatial_outputs(outputs)
+    return outputs
+
+
 def conv(
     inputs,
     kernel,
@@ -1043,10 +1131,6 @@ def dot_product_attention(
     flash_attention=None,
     attn_logits_soft_cap=None,
 ):
-    if bias is not None:
-        raise ValueError(
-            "torch's `dot_product_attention` doesn't support `bias`."
-        )
     query = convert_to_tensor(query)
     key = convert_to_tensor(key)
     value = convert_to_tensor(value)
@@ -1055,6 +1139,10 @@ def dot_product_attention(
             "`dot_product_attention` only supports 4D inputs. "
             f"Received: query.shape={query.shape}, key.shape={key.shape}, "
             f"value.shape={value.shape}."
+        )
+    if bias is not None and mask is not None:
+        raise ValueError(
+            "Only one of `bias` and `mask` can be provided. Received both."
         )
     compute_dtype = backend.result_type(query.dtype, key.dtype, value.dtype)
     query = cast(query, compute_dtype)
@@ -1066,6 +1154,9 @@ def dot_product_attention(
         # Explicit set `is_causal` to `False` when `mask` is not `None`.
         is_causal = False
         mask = torch.where(mask, 0.0, _get_large_negative(query.dtype))
+    if bias is not None:
+        bias = convert_to_tensor(bias, dtype=compute_dtype)
+        mask = bias  # Use `bias` as `mask` for scaled_dot_product_attention.
 
     axis0, axis1 = 1, 2
     query = torch.transpose(query, axis0, axis1)

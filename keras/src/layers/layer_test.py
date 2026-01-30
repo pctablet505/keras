@@ -589,6 +589,23 @@ class LayerTest(testing.TestCase):
         layer(layers.Input(batch_shape=(2, 2)))
         self.assertLen(layer.losses, 0)
 
+    @parameterized.named_parameters(
+        ("batch_size_0", 0),
+        ("batch_size_1", 1),
+        ("batch_size_5", 5),
+        ("batch_size_10", 10),
+    )
+    def test_activity_regularization_batch_normalization(self, batch_size):
+        class SimpleLayer(layers.Layer):
+            def call(self, x):
+                return x
+
+        layer = SimpleLayer(activity_regularizer="l2")
+        layer(ops.ones((batch_size, 5)) * 2.0)
+        self.assertLen(layer.losses, 1)
+        expected_loss = 0.0 if batch_size == 0 else 0.2
+        self.assertAllClose(layer.losses[0], expected_loss)
+
     @pytest.mark.requires_trainable_backend
     def test_add_loss(self):
         class LossLayer(layers.Layer):
@@ -806,6 +823,33 @@ class LayerTest(testing.TestCase):
 
         x = [np.zeros(1, dtype="float64"), np.zeros(1, dtype="int32")]
         CustomLayer()(x)
+
+    @pytest.mark.skipif(
+        backend.backend() == "numpy", reason="masking not supported with numpy"
+    )
+    def test_keras_mask_with_autocast(self):
+        assertAllEqual = self.assertAllEqual
+        assertDType = self.assertDType
+
+        class CustomLayer(layers.Layer):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.supports_masking = True
+
+            def call(self, x, mask=None):
+                assert mask is not None
+                assertDType(x, "float16")
+                return x
+
+        x = ops.zeros((1, 2), dtype="float32")
+        mask = ops.array([True, False])
+        backend.set_keras_mask(x, mask)
+        y = CustomLayer(dtype="float16")(x)
+        assertAllEqual(
+            mask,
+            backend.get_keras_mask(y),
+            "Masking is not propagated by Autocast",
+        )
 
     @pytest.mark.skipif(
         backend.backend() == "numpy", reason="masking not supported with numpy"

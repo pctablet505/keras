@@ -1359,11 +1359,7 @@ def deg2rad(x):
 def diag(x, k=0):
     x = convert_to_tensor(x)
     if len(x.shape) == 1:
-        return tf.cond(
-            tf.equal(tf.size(x), 0),
-            lambda: tf.zeros([builtins.abs(k), builtins.abs(k)], dtype=x.dtype),
-            lambda: tf.linalg.diag(x, k=k),
-        )
+        return tf.linalg.diag(x, k=k)
     elif len(x.shape) == 2:
         return diagonal(x, offset=k)
     else:
@@ -2129,6 +2125,83 @@ def moveaxis(x, source, destination):
     return tf.transpose(x, perm)
 
 
+def nanmax(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+
+    if not x.dtype.is_floating:
+        dtype = standardize_dtype(x.dtype)
+        if dtype == "bool":
+            return tf.reduce_any(x, axis=axis, keepdims=keepdims)
+        return tf.reduce_max(x, axis=axis, keepdims=keepdims)
+
+    x_clean = tf.where(
+        tf.math.is_nan(x), tf.constant(float("-inf"), dtype=x.dtype), x
+    )
+
+    return tf.where(
+        tf.reduce_all(tf.math.is_nan(x), axis=axis, keepdims=keepdims),
+        tf.constant(float("nan"), dtype=x.dtype),
+        tf.reduce_max(x_clean, axis=axis, keepdims=keepdims),
+    )
+
+
+def nanmean(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+
+    if axis == () or axis == []:
+        return x
+
+    if not x.dtype.is_floating:
+        return tf.reduce_mean(
+            tf.cast(x, "float32"), axis=axis, keepdims=keepdims
+        )
+
+    dtype = dtypes.result_type(standardize_dtype(x.dtype), float)
+    total_sum = cast(nansum(x, axis=axis, keepdims=keepdims), dtype)
+    normalizer = tf.reduce_sum(
+        cast(~tf.math.is_nan(x), dtype),
+        axis=axis,
+        keepdims=keepdims,
+    )
+    return tf.divide(total_sum, normalizer)
+
+
+def nanmin(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+
+    if not x.dtype.is_floating:
+        dtype = standardize_dtype(x.dtype)
+        if dtype == "bool":
+            return tf.reduce_all(x, axis=axis, keepdims=keepdims)
+        return tf.reduce_min(x, axis=axis, keepdims=keepdims)
+
+    x_clean = tf.where(
+        tf.math.is_nan(x), tf.constant(float("inf"), dtype=x.dtype), x
+    )
+
+    return tf.where(
+        tf.reduce_all(tf.math.is_nan(x), axis=axis, keepdims=keepdims),
+        tf.constant(float("nan"), dtype=x.dtype),
+        tf.reduce_min(x_clean, axis=axis, keepdims=keepdims),
+    )
+
+
+def nansum(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+    dtype = standardize_dtype(x.dtype)
+    x_clean = tf.where(
+        tf.math.is_nan(cast(x, config.floatx())), tf.zeros((), dtype=dtype), x
+    )
+
+    if dtype in ("bool", "int8", "int16"):
+        dtype = "int32"
+    elif dtype in ("uint8", "uint16"):
+        dtype = "uint32"
+    x_clean = cast(x_clean, dtype)
+
+    return tf.reduce_sum(x_clean, axis=axis, keepdims=keepdims)
+
+
 def nan_to_num(x, nan=0.0, posinf=None, neginf=None):
     x = convert_to_tensor(x)
 
@@ -2155,7 +2228,7 @@ def nan_to_num(x, nan=0.0, posinf=None, neginf=None):
 
 def ndim(x):
     x = convert_to_tensor(x)
-    return x.ndim
+    return x.shape.rank
 
 
 def nonzero(x):
@@ -2217,6 +2290,13 @@ def prod(x, axis=None, keepdims=False, dtype=None):
             dtype = "uint32"
         x = tf.cast(x, dtype)
     return tf.reduce_prod(x, axis=axis, keepdims=keepdims)
+
+
+def ptp(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+    return tf.reduce_max(x, axis=axis, keepdims=keepdims) - tf.reduce_min(
+        x, axis=axis, keepdims=keepdims
+    )
 
 
 def _quantile(x, q, axis=None, method="linear", keepdims=False):
@@ -2759,19 +2839,33 @@ def round(x, decimals=0):
 
 def tile(x, repeats):
     x = convert_to_tensor(x)
-    repeats = tf.reshape(convert_to_tensor(repeats, dtype="int32"), [-1])
-    repeats_size = tf.size(repeats)
-    repeats = tf.pad(
-        repeats,
-        [[tf.maximum(x.shape.rank - repeats_size, 0), 0]],
-        constant_values=1,
-    )
-    x_shape = tf.pad(
-        tf.shape(x),
-        [[tf.maximum(repeats_size - x.shape.rank, 0), 0]],
-        constant_values=1,
-    )
-    x = tf.reshape(x, x_shape)
+
+    # Convert repeats to a list (works for both sequences and 1D tensors)
+    if isinstance(repeats, int):
+        repeats = [repeats]
+    else:
+        repeats = [v for v in repeats]
+
+    # Process list elements: convert concrete scalar tensors to Python ints
+    processed_repeats = []
+    for r in repeats:
+        if hasattr(r, "numpy") and r.shape == ():
+            processed_repeats.append(int(r.numpy()))
+        else:
+            processed_repeats.append(r)
+    repeats = processed_repeats
+
+    # Get x rank
+    x_rank = x.shape.rank
+
+    # Pad repeats if needed
+    if len(repeats) < x_rank:
+        repeats = [1] * (x_rank - len(repeats)) + repeats
+
+    # Add dimensions to x if needed using tf.expand_dims
+    while len(repeats) > x.shape.rank:
+        x = tf.expand_dims(x, 0)
+
     return tf.tile(x, repeats)
 
 
@@ -3007,6 +3101,16 @@ def negative(x):
     return tf.negative(x)
 
 
+def nextafter(x1, x2):
+    x1 = convert_to_tensor(x1)
+    x2 = convert_to_tensor(x2)
+
+    dtype = dtypes.result_type(x1.dtype, x2.dtype, float)
+    x1 = tf.cast(x1, tf.float64)
+    x2 = tf.cast(x2, tf.float64)
+    return tf.cast(tf.math.nextafter(x1, x2), dtype)
+
+
 @sparse.elementwise_unary
 def square(x):
     x = convert_to_tensor(x)
@@ -3095,6 +3199,27 @@ def trapezoid(y, x=None, dx=1.0, axis=-1):
     result = tf.reduce_sum(avg_heights * dx_array, axis=-1)
 
     return result
+
+
+def vander(x, N=None, increasing=False):
+    x = convert_to_tensor(x)
+    result_dtype = dtypes.result_type(x.dtype)
+
+    if N is None:
+        N = shape_op(x)[0]
+
+    if increasing:
+        powers = tf.range(N)
+    else:
+        powers = tf.range(N - 1, -1, -1)
+
+    x_exp = tf.expand_dims(x, axis=-1)
+
+    compute_dtype = dtypes.result_type(x.dtype, "float32")
+    vander = tf.math.pow(
+        tf.cast(x_exp, compute_dtype), tf.cast(powers, compute_dtype)
+    )
+    return tf.cast(vander, result_dtype)
 
 
 def var(x, axis=None, keepdims=False):

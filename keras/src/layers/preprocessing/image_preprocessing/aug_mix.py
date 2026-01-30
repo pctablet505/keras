@@ -5,6 +5,9 @@ from keras.src.api_export import keras_export
 from keras.src.layers.preprocessing.image_preprocessing.base_image_preprocessing_layer import (  # noqa: E501
     BaseImagePreprocessingLayer,
 )
+from keras.src.layers.preprocessing.image_preprocessing.base_image_preprocessing_layer import (  # noqa: E501
+    base_image_preprocessing_transform_example,
+)
 from keras.src.random import SeedGenerator
 from keras.src.utils import backend_utils
 
@@ -71,6 +74,10 @@ class AugMix(BaseImagePreprocessingLayer):
         interpolation: The interpolation method to use for resizing operations.
             Options include `"nearest"`, `"bilinear"`. Default is `"bilinear"`.
         seed: Integer. Used to create a random seed.
+
+    Example:
+
+    {{base_image_preprocessing_transform_example}}
     """
 
     _USE_BASE_FACTOR = False
@@ -316,8 +323,8 @@ class AugMix(BaseImagePreprocessingLayer):
     def get_config(self):
         config = {
             "value_range": self.value_range,
-            "num_chains": self.chain_depth,
-            "chain_depth": self.num_chains,
+            "num_chains": self.num_chains,
+            "chain_depth": self.chain_depth,
             "factor": self.factor,
             "alpha": self.alpha,
             "all_ops": self.all_ops,
@@ -326,3 +333,9 @@ class AugMix(BaseImagePreprocessingLayer):
         }
         base_config = super().get_config()
         return {**base_config, **config}
+
+
+AugMix.__doc__ = AugMix.__doc__.replace(
+    "{{base_image_preprocessing_transform_example}}",
+    base_image_preprocessing_transform_example.replace("{LayerName}", "AugMix"),
+)

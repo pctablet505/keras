@@ -30,9 +30,7 @@ class JaxVariable(KerasVariable):
         self._layout = layout
         super().__init__(*args, **kwargs)
 
-    def _initialize(self, value):
-        # Note that variable.shape is needed by distribution_lib
-        self._shape = self._validate_shape(value.shape)
+    def _initialize_layout(self):
         # We can't import the keras/distribution/distribution_lib
         # due to circular dependency.
         distribution = global_state.get_global_attribute("distribution")
@@ -44,7 +42,27 @@ class JaxVariable(KerasVariable):
                 self._layout = tensor_layout.backend_layout
             else:
                 self._layout = tensor_layout
+
+    def _initialize(self, value):
+        # Note that variable.shape is needed by distribution_lib
+        self._shape = self._validate_shape(value.shape)
+        self._initialize_layout()
         self._direct_assign(value)
+
+    def _initialize_with_initializer(self, initializer):
+        self._initialize_layout()
+        layout = self._layout
+        shape = self._shape
+        if should_shard_at_init(layout, shape):
+            jitted_initializer = jax.jit(
+                initializer.__call__,
+                out_shardings=layout,
+                static_argnames=["shape", "dtype"],
+            )
+            value = jitted_initializer(shape=self._shape, dtype=self._dtype)
+            self._value = value
+        else:
+            super()._initialize_with_initializer(initializer)
 
     def _direct_assign(self, value):
         if self._layout is not None:
@@ -80,7 +98,7 @@ if config.is_nnx_enabled():
         ):
             # Ensure 'mutable' is in nnx_metadata, but explicit 'mutable'
             # param takes precedence.
-            nnx_metadata["mutable"] = trainable if mutable is None else mutable
+            nnx_metadata["mutable"] = True if mutable is None else mutable
 
             # First, initialize a basic nnx.Variable with a dummy value
             # This sets up the NNX variable structure
@@ -111,6 +129,12 @@ if config.is_nnx_enabled():
 
             # The real value is now set in self._value, sync it to raw_value
             object.__setattr__(self, "raw_value", self._value)
+
+        def _initialize_with_initializer(self, initializer):
+            value = self._convert_to_tensor(
+                initializer(self._shape, dtype=self._dtype)
+            )
+            self._initialize(value)
 
         @property
         def _value(self):
@@ -286,6 +310,18 @@ if config.is_nnx_enabled():
         object.__setattr__(self, name, value)
 
     NnxVariable.__setattr__ = __setattr__
+
+
+def should_shard_at_init(init_layout, shape):
+    if not isinstance(init_layout, jax.sharding.NamedSharding):
+        return False
+
+    if all(dim is None for dim in init_layout.spec):
+        return False
+
+    size_threshold = 250 * 1024 * 1024
+    array_size = np.prod(shape) * 4
+    return array_size >= size_threshold
 
 
 def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
@@ -567,7 +603,17 @@ def random_seed_dtype():
 
 
 def custom_gradient(fun):
-    return jax.custom_gradient(fun=fun)
+    fun_with_custom_gradient = jax.custom_gradient(fun=fun)
+
+    # Add a wrapper to unwrap variables, otherwise custom_gradient will fail
+    def fun_with_custom_gradient_wrapper(*args, **kwargs):
+        args, kwargs = tree.map_shape_structure(
+            lambda x: x.value if isinstance(x, KerasVariable) else x,
+            (args, kwargs),
+        )
+        return fun_with_custom_gradient(*args, **kwargs)
+
+    return fun_with_custom_gradient_wrapper
 
 
 def remat(f):

@@ -27,6 +27,7 @@ from keras.src import backend
 from keras.src import constraints
 from keras.src import dtype_policies
 from keras.src import initializers
+from keras.src import ops
 from keras.src import regularizers
 from keras.src import tree
 from keras.src import utils
@@ -45,6 +46,7 @@ from keras.src.layers import input_spec
 from keras.src.metrics.metric import Metric
 from keras.src.ops.node import Node
 from keras.src.ops.operation import Operation
+from keras.src.quantizers.quantization_config import validate_and_resolve_config
 from keras.src.utils import python_utils
 from keras.src.utils import summary_utils
 from keras.src.utils import traceback_utils
@@ -244,11 +246,13 @@ class Layer(BackendLayer, Operation):
         original_quantize_method = obj.quantize
 
         @wraps(original_quantize_method)
-        def quantize_wrapper(mode, **kwargs):
+        def quantize_wrapper(mode=None, config=None, **kwargs):
+            config = validate_and_resolve_config(mode, config)
+            mode = config.mode
             obj._check_quantize_args(mode, obj.compute_dtype)
             obj._tracker.unlock()
             try:
-                original_quantize_method(mode, **kwargs)
+                original_quantize_method(mode=mode, config=config, **kwargs)
             except Exception:
                 raise
             finally:
@@ -833,9 +837,14 @@ class Layer(BackendLayer, Operation):
         #############################################################
         # 1. Convert any array arguments to tensors of correct dtype.
         def maybe_convert(x):
-            return self.dtype_policy.convert_input(
+            # Prevent _keras_mask from disappearing
+            mask = backend.get_keras_mask(x)
+            y = self.dtype_policy.convert_input(
                 x, self.autocast, self.input_dtype
             )
+            if mask is not None:
+                backend.set_keras_mask(y, mask)
+            return y
 
         # Used to avoid expensive `tree` operations in the most common case.
         if (
@@ -966,7 +975,15 @@ class Layer(BackendLayer, Operation):
                 if self.activity_regularizer is not None:
                     for output in tree.flatten(outputs):
                         if backend.is_tensor(output):
-                            self.add_loss(self.activity_regularizer(output))
+                            loss = self.activity_regularizer(output)
+                            if output.ndim > 0:
+                                # Normalize by batch size to ensure consistent
+                                # regularization strength across batch sizes
+                                batch_size = ops.cast(
+                                    ops.shape(output)[0], dtype=loss.dtype
+                                )
+                                loss = ops.divide_no_nan(loss, batch_size)
+                            self.add_loss(loss)
 
             # Set `previous_mask` on outputs if available. It is provided only
             # for the first positional input arg and its mask.
@@ -1277,7 +1294,7 @@ class Layer(BackendLayer, Operation):
     def quantized_build(self, input_shape, mode):
         raise self._not_implemented_error(self.quantized_build)
 
-    def quantize(self, mode, type_check=True, config=None):
+    def quantize(self, mode=None, type_check=True, config=None):
         raise self._not_implemented_error(self.quantize)
 
     def _check_quantize_args(self, mode, compute_dtype):
@@ -1329,6 +1346,8 @@ class Layer(BackendLayer, Operation):
             return self._int4_call(*args, **kwargs)
         elif self.quantization_mode == "gptq":
             return self._gptq_call(*args, **kwargs)
+        elif self.quantization_mode == "awq":
+            return self._awq_call(*args, **kwargs)
         else:
             raise self._quantization_mode_error(self.quantization_mode)
 
@@ -1343,6 +1362,9 @@ class Layer(BackendLayer, Operation):
 
     def _gptq_call(self, *args, **kwargs):
         raise self._not_implemented_error(self._gptq_call)
+
+    def _awq_call(self, *args, **kwargs):
+        raise self._not_implemented_error(self._awq_call)
 
     def _not_implemented_error(self, attr, msg=None):
         if callable(attr):
