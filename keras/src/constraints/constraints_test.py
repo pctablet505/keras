@@ -2,6 +2,7 @@ import numpy as np
 
 from keras.src import backend
 from keras.src import constraints
+from keras.src import layers
 from keras.src import testing
 
 
@@ -58,6 +59,23 @@ class ConstraintsTest(testing.TestCase):
         with self.assertRaises(ValueError):
             constraints.get("typo")
 
+    def test_plain_callable_constraint(self):
+        # Regression test for GitHub issue #22221: plain callables should be
+        # accepted as constraints rather than raising ValueError.
+        def my_constraint(w):
+            return w * 2
+
+        obj = constraints.get(my_constraint)
+        self.assertIsInstance(obj, constraints.Constraint)
+        result = obj(np.array([1.0, 2.0]))
+        self.assertAllClose(result, [2.0, 4.0])
+
+    def test_plain_callable_constraint_not_serializable(self):
+        fn = lambda w: w
+        obj = constraints.get(fn)
+        with self.assertRaises(NotImplementedError):
+            obj.get_config()
+
     def test_default_constraint_call(self):
         constraint_fn = constraints.Constraint()
         x = np.array([1.0, 2.0, 3.0])
@@ -99,3 +117,21 @@ class ConstraintsTest(testing.TestCase):
             "axis": 1,
         }
         self.assertEqual(config, expected_config)
+
+    def test_add_weight_with_plain_callable_constraint(self):
+        # Regression test for GitHub issue #22221: add_weight(constraint=...)
+        # should accept a plain callable, not just Constraint subclasses.
+        class MyLayer(layers.Layer):
+            def build(self, input_shape):
+                self.w = self.add_weight(
+                    shape=(2,),
+                    initializer="ones",
+                    constraint=lambda w: w * 0.5,
+                )
+
+            def call(self, x):
+                return x
+
+        layer = MyLayer()
+        layer.build((None, 2))
+        self.assertIsInstance(layer.w.constraint, constraints.Constraint)

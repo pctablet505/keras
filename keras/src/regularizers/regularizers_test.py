@@ -78,6 +78,24 @@ class RegularizersTest(testing.TestCase):
         with self.assertRaises(ValueError):
             regularizers.get("typo")
 
+    def test_plain_callable_regularizer(self):
+        # Regression test for GitHub issue #22221: plain callables should be
+        # accepted as regularizers rather than raising ValueError.
+        import numpy as np
+        from keras.src import ops
+
+        def my_regularizer(x):
+            return ops.sum(ops.abs(x)) * 0.1
+
+        obj = regularizers.get(my_regularizer)
+        self.assertIsInstance(obj, regularizers.Regularizer)
+
+    def test_plain_callable_regularizer_not_serializable(self):
+        fn = lambda x: x
+        obj = regularizers.get(fn)
+        with self.assertRaises(NotImplementedError):
+            obj.get_config()
+
     def test_l1l2_get_config(self):
         l1 = 0.01
         l2 = 0.02

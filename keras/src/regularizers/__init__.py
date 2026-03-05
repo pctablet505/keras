@@ -38,6 +38,23 @@ def deserialize(config, custom_objects=None):
     )
 
 
+class _CallableRegularizer(Regularizer):
+    """Adapter that wraps a plain callable as a `Regularizer` instance."""
+
+    def __init__(self, fn):
+        self.fn = fn
+
+    def __call__(self, x):
+        return self.fn(x)
+
+    def get_config(self):
+        raise NotImplementedError(
+            "Plain callable regularizers cannot be serialized. "
+            "To enable serialization, subclass "
+            "`keras.regularizers.Regularizer` and implement `get_config()`."
+        )
+
+
 @keras_export("keras.regularizers.get")
 def get(identifier):
     """Retrieve a Keras regularizer object via an identifier."""
@@ -53,6 +70,8 @@ def get(identifier):
     if callable(obj):
         if inspect.isclass(obj):
             obj = obj()
+        if not isinstance(obj, Regularizer):
+            obj = _CallableRegularizer(obj)
         return obj
     else:
         raise ValueError(

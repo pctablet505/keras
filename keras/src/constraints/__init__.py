@@ -38,6 +38,23 @@ def deserialize(config, custom_objects=None):
     )
 
 
+class _CallableConstraint(Constraint):
+    """Adapter that wraps a plain callable as a `Constraint` instance."""
+
+    def __init__(self, fn):
+        self.fn = fn
+
+    def __call__(self, w):
+        return self.fn(w)
+
+    def get_config(self):
+        raise NotImplementedError(
+            "Plain callable constraints cannot be serialized. "
+            "To enable serialization, subclass "
+            "`keras.constraints.Constraint` and implement `get_config()`."
+        )
+
+
 @keras_export("keras.constraints.get")
 def get(identifier):
     """Retrieve a Keras constraint object via an identifier."""
@@ -53,6 +70,8 @@ def get(identifier):
     if callable(obj):
         if inspect.isclass(obj):
             obj = obj()
+        if not isinstance(obj, Constraint):
+            obj = _CallableConstraint(obj)
         return obj
     else:
         raise ValueError(
