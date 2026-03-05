@@ -208,9 +208,7 @@ class BaseImagePreprocessingLayer(DataLayer):
                     )
                 if is_int_dtype(orig_mask_dtype):
                     data["segmentation_masks"] = self.backend.cast(
-                        self.backend.numpy.round(
-                            data["segmentation_masks"]
-                        ),
+                        self.backend.numpy.round(data["segmentation_masks"]),
                         orig_mask_dtype,
                     )
             return data
