@@ -38,9 +38,7 @@ class ProgbarTest(testing.TestCase):
 
     def test_stateful_metrics_display_latest_value(self):
         """Stateful metrics should display the latest value, not average."""
-        pb = progbar.Progbar(
-            target=5, verbose=2, stateful_metrics=["accuracy"]
-        )
+        pb = progbar.Progbar(target=5, verbose=2, stateful_metrics=["accuracy"])
         # Simulate accumulated running averages from evaluate()
         running_averages = [0.60, 0.65, 0.70, 0.75, 0.80]
         for i, acc in enumerate(running_averages):
