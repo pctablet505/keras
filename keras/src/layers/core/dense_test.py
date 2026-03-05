@@ -166,7 +166,7 @@ class DenseTest(testing.TestCase):
             layer(keras_tensor.KerasTensor((1, 3)))
 
     def test_dense_integer_like_units(self):
-        """Dense should accept integer-like types (numpy, ops.prod) for units."""
+        """Dense accepts integer-like units (numpy, ops.prod)."""
         import numpy as np
 
         # numpy integer
