@@ -243,4 +243,3 @@ class StringLookupTest(testing.TestCase):
         symbolic_output = layer(symbolic_input)
         # Should be (None, 2, 3, 20), not (None, 20)
         self.assertEqual(symbolic_output.shape, (None, 2, 3, 20))
-
