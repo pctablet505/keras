@@ -165,6 +165,25 @@ class DenseTest(testing.TestCase):
             layer(keras_tensor.KerasTensor((1, 2)))
             layer(keras_tensor.KerasTensor((1, 3)))
 
+    def test_dense_integer_like_units(self):
+        """Dense should accept integer-like types (numpy, ops.prod) for units."""
+        import numpy as np
+
+        # numpy integer
+        layer = layers.Dense(np.int64(16))
+        self.assertEqual(layer.units, 16)
+        self.assertIsInstance(layer.units, int)
+
+        # ops.prod result (backend tensor)
+        units_tensor = ops.prod((4, 4))
+        layer2 = layers.Dense(units_tensor)
+        self.assertEqual(layer2.units, 16)
+        self.assertIsInstance(layer2.units, int)
+
+        # Float should still be rejected
+        with self.assertRaises(ValueError):
+            layers.Dense(16.0)
+
     @pytest.mark.skipif(
         not backend.SUPPORTS_SPARSE_TENSORS,
         reason="Backend does not support sparse tensors.",

@@ -1,3 +1,5 @@
+import operator
+
 from keras.src import ops
 from keras.src.api_export import keras_export
 from keras.src.layers.input_spec import InputSpec
@@ -27,6 +29,10 @@ class RepeatVector(Layer):
 
     def __init__(self, n, **kwargs):
         super().__init__(**kwargs)
+        try:
+            n = operator.index(n)
+        except (TypeError, OverflowError):
+            pass
         self.n = n
         if not isinstance(n, int):
             raise TypeError(
