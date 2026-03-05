@@ -85,6 +85,27 @@ class TextVectorizationTest(testing.TestCase, parameterized.TestCase):
         model = saving.load_model(temp_filepath)
         self.assertAllClose(output, model(input_data))
 
+    @pytest.mark.skipif(
+        backend.backend() != "tensorflow", reason="Requires string input dtype"
+    )
+    def test_save_load_tf_idf_mode(self):
+        # Regression test for GitHub issue #22004: saving/loading a
+        # TextVectorization layer in tf_idf mode crashed because
+        # self.idf_weights does not exist before adapt is called.
+        input_data = np.array(["foo bar", "bar baz", "baz bada boom"])
+        model = Sequential(
+            [
+                layers.Input(dtype="string", shape=(1,)),
+                layers.TextVectorization(output_mode="tf_idf"),
+            ]
+        )
+        model.layers[0].adapt(input_data)
+        output = model(input_data)
+        temp_filepath = os.path.join(self.get_temp_dir(), "model.keras")
+        model.save(temp_filepath)
+        loaded_model = saving.load_model(temp_filepath)
+        self.assertAllClose(output, loaded_model(input_data))
+
     def test_tf_data_compatibility(self):
         max_tokens = 5000
         max_len = 4
