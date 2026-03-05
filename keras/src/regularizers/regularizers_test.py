@@ -81,7 +81,6 @@ class RegularizersTest(testing.TestCase):
     def test_plain_callable_regularizer(self):
         # Regression test for GitHub issue #22221: plain callables should be
         # accepted as regularizers rather than raising ValueError.
-        import numpy as np
         from keras.src import ops
 
         def my_regularizer(x):
