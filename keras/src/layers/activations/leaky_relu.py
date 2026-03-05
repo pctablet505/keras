@@ -45,7 +45,9 @@ class LeakyReLU(Layer):
         super().__init__(**kwargs)
         if (
             negative_slope is None
-            or (isinstance(negative_slope, float) and math.isnan(negative_slope))
+            or (
+                isinstance(negative_slope, float) and math.isnan(negative_slope)
+            )
             or negative_slope < 0
         ):
             raise ValueError(
