@@ -92,6 +92,10 @@ class ProgbarLogger(Callback):
         self.seen = batch + 1  # One-indexed.
 
         if self.verbose == 1:
+            # Batch logs already contain accumulated metric values (running
+            # averages over all batches seen so far). Mark them as stateful
+            # so the progress bar displays them as-is instead of re-averaging.
+            self.progbar.stateful_metrics.update(logs.keys())
             self.progbar.update(self.seen, list(logs.items()), finalize=False)
 
     def _finalize_progbar(self, logs):
