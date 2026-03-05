@@ -221,3 +221,26 @@ class StringLookupTest(testing.TestCase):
         vocab = layer.get_vocabulary(include_special_tokens=False)
 
         self.assertEqual(vocab, ["a", "b", "c"])
+
+    @pytest.mark.skipif(
+        backend.backend() != "tensorflow", reason="Requires string input dtype"
+    )
+    def test_one_hot_symbolic_shape_nested_input(self):
+        # Regression test for GitHub issue #22336: StringLookup with
+        # output_mode="one_hot" was returning (None, depth) instead of
+        # (None, d1, d2, depth) for nested inputs in symbolic mode.
+        import keras
+
+        layer = layers.StringLookup(
+            max_tokens=20,
+            num_oov_indices=4,
+            oov_token="[UNK]",
+            vocabulary=["a", "b", "c", "d", "e"],
+            output_mode="one_hot",
+            pad_to_max_tokens=True,
+        )
+        symbolic_input = keras.Input(shape=(2, 3), dtype="string")
+        symbolic_output = layer(symbolic_input)
+        # Should be (None, 2, 3, 20), not (None, 20)
+        self.assertEqual(symbolic_output.shape, (None, 2, 3, 20))
+

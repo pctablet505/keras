@@ -570,7 +570,13 @@ class IndexLookup(Layer):
             if self.pad_to_max_tokens
             else self._frozen_vocab_size
         )
-        return (input_shape[0], depth)
+        if self.output_mode == "one_hot":
+            # Each input token is encoded as a one-hot vector, so all input
+            # dimensions are preserved and depth is appended.
+            return tuple(input_shape) + (depth,)
+        # multi_hot, count, tf_idf: reduce over the last input dimension
+        # (treated as a sequence of tokens), depth replaces it.
+        return tuple(input_shape[:-1]) + (depth,)
 
     def compute_output_spec(self, inputs):
         if self.output_mode == "int":
