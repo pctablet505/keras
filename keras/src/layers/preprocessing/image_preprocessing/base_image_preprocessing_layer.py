@@ -1,6 +1,8 @@
 import math
 
 from keras.src.backend import config as backend_config
+from keras.src.backend.common.variables import is_int_dtype
+from keras.src.backend.common.variables import standardize_dtype
 from keras.src.layers.preprocessing.data_layer import DataLayer
 from keras.src.layers.preprocessing.image_preprocessing.bounding_boxes.validation import (  # noqa: E501
     densify_bounding_boxes,
@@ -185,6 +187,9 @@ class BaseImagePreprocessingLayer(DataLayer):
                         training=training,
                     )
             if "segmentation_masks" in data:
+                orig_mask_dtype = standardize_dtype(
+                    data["segmentation_masks"].dtype
+                )
                 if is_batched:
                     data["segmentation_masks"] = (
                         self.transform_segmentation_masks(
@@ -200,6 +205,13 @@ class BaseImagePreprocessingLayer(DataLayer):
                             transformation=transformation,
                             training=training,
                         )
+                    )
+                if is_int_dtype(orig_mask_dtype):
+                    data["segmentation_masks"] = self.backend.cast(
+                        self.backend.numpy.round(
+                            data["segmentation_masks"]
+                        ),
+                        orig_mask_dtype,
                     )
             return data
 

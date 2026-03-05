@@ -283,3 +283,22 @@ class RandomFlipTest(testing.TestCase):
         output = next(iter(ds))
         expected_boxes = np.array(expected_boxes)
         self.assertAllClose(output["boxes"], expected_boxes)
+
+    def test_segmentation_mask_dtype_preserved(self):
+        images = np.random.random((2, 8, 8, 3)).astype("float32")
+        masks_uint8 = np.random.randint(0, 5, (2, 8, 8, 1)).astype("uint8")
+        data = {"images": images, "segmentation_masks": masks_uint8}
+        layer = layers.RandomFlip("horizontal", seed=42)
+        result = layer(data, training=True)
+        out_dtype = backend.standardize_dtype(
+            result["segmentation_masks"].dtype
+        )
+        self.assertEqual(out_dtype, "uint8")
+
+        masks_int32 = masks_uint8.astype("int32")
+        data_int32 = {"images": images, "segmentation_masks": masks_int32}
+        result_int32 = layer(data_int32, training=True)
+        out_dtype_int32 = backend.standardize_dtype(
+            result_int32["segmentation_masks"].dtype
+        )
+        self.assertEqual(out_dtype_int32, "int32")

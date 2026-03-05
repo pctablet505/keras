@@ -75,3 +75,14 @@ class RandomRotationTest(testing.TestCase):
         ).reshape(input_shape[1:])
         output = next(iter(ds)).numpy()
         self.assertAllClose(expected_output, output)
+
+    def test_segmentation_mask_dtype_preserved(self):
+        images = np.random.random((2, 8, 8, 3)).astype("float32")
+        masks = np.random.randint(0, 5, (2, 8, 8, 1)).astype("uint8")
+        data = {"images": images, "segmentation_masks": masks}
+        layer = layers.RandomRotation(0.1, seed=42)
+        result = layer(data, training=True)
+        out_dtype = backend.standardize_dtype(
+            result["segmentation_masks"].dtype
+        )
+        self.assertEqual(out_dtype, "uint8")
