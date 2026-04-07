@@ -100,6 +100,8 @@ def to_torch_dtype(dtype):
     standardized_dtype = TORCH_DTYPES.get(standardize_dtype(dtype), None)
     if standardized_dtype is None:
         raise ValueError(f"Unsupported dtype for PyTorch: {dtype}")
+    if standardized_dtype == torch.float64 and get_device() == "mps":
+        return torch.float32
     return standardized_dtype
 
 
