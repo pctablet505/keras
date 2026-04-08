@@ -980,22 +980,31 @@ class Layer(BackendLayer, Operation):
                     n == 1
                     and backend.is_tensor(args[0])
                     and backend.get_keras_mask(args[0]) is None
+                    and backend.standardize_dtype(args[0].dtype)
+                    == self.input_dtype
                 ):
+                    # Ensure correct device (cheap: fast-path returns
+                    # immediately when already on the right device).
+                    _arg = backend.convert_to_tensor(args[0])
                     return (
-                        self.call(args[0], **_kwargs)
+                        self.call(_arg, **_kwargs)
                         if _kwargs
-                        else self.call(args[0])
+                        else self.call(_arg)
                     )
                 if (
                     n == 2
                     and backend.is_tensor(args[0])
                     and backend.is_tensor(args[1])
                     and backend.get_keras_mask(args[0]) is None
+                    and backend.standardize_dtype(args[0].dtype)
+                    == self.input_dtype
                 ):
+                    _arg0 = backend.convert_to_tensor(args[0])
+                    _arg1 = backend.convert_to_tensor(args[1])
                     return (
-                        self.call(args[0], args[1], **_kwargs)
+                        self.call(_arg0, _arg1, **_kwargs)
                         if _kwargs
-                        else self.call(args[0], args[1])
+                        else self.call(_arg0, _arg1)
                     )
 
         # Full path with traceback filtering.
@@ -1022,21 +1031,14 @@ class Layer(BackendLayer, Operation):
             return y
 
         # Used to avoid expensive `tree` operations in the most common case.
-        if (
-            kwargs
-            or len(args) != 1
-            or not is_backend_tensor_or_symbolic(args[0], allow_none=False)
-            or backend.standardize_dtype(args[0].dtype) != self.input_dtype
-        ) and self._convert_input_args:
-            # Fast path: single tensor arg (with or without kwargs)
+        if self._convert_input_args:
             if len(args) == 1 and is_backend_tensor_or_symbolic(
                 args[0], allow_none=False
             ):
-                # Only convert the tensor arg if dtype differs
-                if backend.standardize_dtype(args[0].dtype) != self.input_dtype:
-                    args = (maybe_convert(args[0]),)
-                # kwargs don't need dtype conversion (they're masks, caches,
-                # indices, booleans — not input tensors)
+                # Fast path: single arg — call maybe_convert directly instead
+                # of going through tree.map_structure. Also ensures correct
+                # device even when dtype already matches.
+                args = (maybe_convert(args[0]),)
             else:
                 args = tree.map_structure(maybe_convert, args)
                 kwargs = tree.map_structure(maybe_convert, kwargs)

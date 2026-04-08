@@ -173,8 +173,9 @@ class Functional(Function, Model):
                 inputs = args[0]
                 if len(inputs.shape) == len(self._inputs[0].shape):
                     ref = self._inputs[0]
-                    if backend.standardize_dtype(inputs.dtype) != ref.dtype:
-                        inputs = ops.convert_to_tensor(inputs, dtype=ref.dtype)
+                    inputs = ops.convert_to_tensor(
+                        inputs, dtype=ref.dtype
+                    )
                     return self._execute_forward_plan([inputs])
 
         return super().__call__(*args, **kwargs)
@@ -211,8 +212,7 @@ class Functional(Function, Model):
             and getattr(self, "_forward_plan", None) is not None
         ):
             ref = self._inputs[0]
-            if backend.standardize_dtype(inputs.dtype) != ref.dtype:
-                inputs = ops.convert_to_tensor(inputs, dtype=ref.dtype)
+            inputs = ops.convert_to_tensor(inputs, dtype=ref.dtype)
             return self._execute_forward_plan([inputs])
 
         # Fast path: single tensor input, no mask, no extra kwargs.
