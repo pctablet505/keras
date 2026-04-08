@@ -159,7 +159,9 @@ def _get_num_elements(x):
         hasattr(x, "shape")
         and getattr(x.shape, "num_elements", None) is not None
     ):
-        return x.shape.num_elements()
+        n = x.shape.num_elements()
+        if n is not None:  # TF returns None for dynamic/unknown shapes
+            return n
     try:
         if hasattr(x, "shape") and x.shape:
             shape = tuple(x.shape)

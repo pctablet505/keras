@@ -238,7 +238,7 @@ class Function(Operation):
         # Store idx_map for the general fallback path.
         self._forward_idx_map = idx_map
 
-    def _execute_forward_plan(self, inputs):
+    def _execute_forward_plan(self, inputs, call_context_dict=None):
         """Execute the pre-compiled forward plan.
 
         Uses a flat list with integer indexing for intermediate results,
@@ -272,6 +272,13 @@ class Function(Operation):
                             if slots[si] is not None:
                                 tensor_dict[oid] = slots[si]
                 args, kwargs = node.arguments.fill_in(tensor_dict)
+                if call_context_dict:
+                    valid_ctx = getattr(fn, "_call_context_args", None)
+                    if valid_ctx:
+                        kwargs = dict(kwargs)
+                        for name, value in call_context_dict.items():
+                            if name in valid_ctx and value is not None:
+                                kwargs[name] = value
                 result = fn(*args, **kwargs)
 
             if multi_out is None:
