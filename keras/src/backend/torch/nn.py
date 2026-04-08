@@ -641,7 +641,12 @@ def _conv2d_channels_last_fast(inputs, kernel, strides, padding):
             # Asymmetric padding: must use F.pad.
             inputs = tnn.pad(
                 inputs,
-                (pad_w // 2, pad_w - pad_w // 2, pad_h // 2, pad_h - pad_h // 2),
+                (
+                    pad_w // 2,
+                    pad_w - pad_w // 2,
+                    pad_h // 2,
+                    pad_h - pad_h // 2,
+                ),
             )
             torch_pad = 0
     else:
@@ -689,9 +694,7 @@ def conv(
                     inputs, kernel, strides, padding
                 )
         elif no_dilation:
-            return _conv2d_channels_last_fast(
-                inputs, kernel, strides, padding
-            )
+            return _conv2d_channels_last_fast(inputs, kernel, strides, padding)
 
     num_spatial_dims = inputs.ndim - 2
     strides = standardize_tuple(strides, num_spatial_dims, "strides")

@@ -482,11 +482,8 @@ class MultiHeadAttention(Layer):
                 " attention scores."
             )
 
-        # Determine whether to use dot-product attention
-        # During inference (training=False/None), dropout is not applied,
-        # so we can use the more efficient fused attention path.
         use_dot_product_attention = not (
-            (self._dropout > 0.0 and training is True)
+            self._dropout > 0.0
             or return_attention_scores
             or (len(query.shape) != 4)
         )

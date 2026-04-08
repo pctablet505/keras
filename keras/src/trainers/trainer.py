@@ -214,7 +214,6 @@ class Trainer:
         # Use object.__setattr__ to bypass Layer/torch.nn.Module tracking.
         object.__setattr__(self, "_cached_metrics", None)
         object.__setattr__(self, "_cached_metric_names", None)
-        object.__setattr__(self, "_symbolic_build_done", False)
         object.__setattr__(self, "_has_extra_losses", None)
         # Reset trainable_weights cache (set via object.__setattr__
         # in torch trainer to bypass tracking).
@@ -1115,9 +1114,6 @@ class Trainer:
             raise ValueError(msg)
 
     def _symbolic_build(self, iterator=None, data_batch=None):
-        # Fast path: skip expensive _flatten_layers when already fully built.
-        if getattr(self, "_symbolic_build_done", False):
-            return
         model_unbuilt = not all(layer.built for layer in self._flatten_layers())
         compile_metrics_unbuilt = (
             self._compile_metrics is not None
@@ -1135,7 +1131,6 @@ class Trainer:
             or compile_loss_unbuilt
             or optimizer_unbuilt
         ):
-            object.__setattr__(self, "_symbolic_build_done", True)
             return
         if model_unbuilt or compile_metrics_unbuilt or compile_loss_unbuilt:
             # Create symbolic tensors matching an input batch.
@@ -1212,6 +1207,9 @@ class Trainer:
             or optimizer_unbuilt
         ):
             self._post_build()
+            # Invalidate metric caches since new metrics may have been created.
+            object.__setattr__(self, "_cached_metrics", None)
+            object.__setattr__(self, "_cached_metric_names", None)
 
 
 def model_supports_jit(model):

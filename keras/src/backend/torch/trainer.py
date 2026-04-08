@@ -193,6 +193,7 @@ class TorchTrainer(base_trainer.Trainer):
 
             self.predict_function = one_step_on_data
         else:
+
             def one_step_on_data(data):
                 """Runs a predict test step on a batch of data."""
                 data = data[0]

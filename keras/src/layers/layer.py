@@ -76,6 +76,7 @@ else:
 if backend.backend() == "torch":
     try:
         import torch as _torch_for_dynamo
+
         _dynamo_disable = _torch_for_dynamo._dynamo.disable
         del _torch_for_dynamo
     except (ImportError, AttributeError):
@@ -273,6 +274,7 @@ class Layer(BackendLayer, Operation):
                 raise
             finally:
                 obj._tracker.lock()
+            obj._update_fast_call()
 
         obj.quantize = quantize_wrapper
 

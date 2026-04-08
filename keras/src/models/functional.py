@@ -169,21 +169,12 @@ class Functional(Function, Model):
             mask = kwargs.get("mask")
             # Only use ultra-fast path for inference (no training, no mask,
             # no other kwargs beyond training/mask).
-            if (
-                not training
-                and mask is None
-                and len(kwargs) <= 1
-            ):
+            if not training and mask is None and len(kwargs) <= 1:
                 inputs = args[0]
                 if len(inputs.shape) == len(self._inputs[0].shape):
                     ref = self._inputs[0]
-                    if (
-                        backend.standardize_dtype(inputs.dtype)
-                        != ref.dtype
-                    ):
-                        inputs = ops.convert_to_tensor(
-                            inputs, dtype=ref.dtype
-                        )
+                    if backend.standardize_dtype(inputs.dtype) != ref.dtype:
+                        inputs = ops.convert_to_tensor(inputs, dtype=ref.dtype)
                     return self._execute_forward_plan([inputs])
 
         return super().__call__(*args, **kwargs)

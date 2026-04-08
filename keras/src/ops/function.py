@@ -256,9 +256,7 @@ class Function(Operation):
             elif pattern == 2:
                 result = fn(slots[in_slots[0]], slots[in_slots[1]])
             elif pattern == 3:
-                result = fn(
-                    slots[in_slots[0]], slots[in_slots[1]], **static_kw
-                )
+                result = fn(slots[in_slots[0]], slots[in_slots[1]], **static_kw)
             else:
                 # General: use fill_in with id-based tensor_dict.
                 node = static_kw
@@ -285,7 +283,8 @@ class Function(Operation):
 
         if self._forward_plan_single_output:
             return slots[self._forward_output_slots[0]]
-        return [slots[i] for i in self._forward_output_slots]
+        output_list = [slots[i] for i in self._forward_output_slots]
+        return tree.pack_sequence_as(self._outputs_struct, output_list)
 
     def _get_operation_for_node(self, node):
         """Get the operation for a node, using NNX mapping if enabled."""
