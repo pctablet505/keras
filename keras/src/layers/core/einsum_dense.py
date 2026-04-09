@@ -348,7 +348,11 @@ class EinsumDense(Layer):
                     ops.reshape(inputs, (-1, contr_size)),
                     ops.reshape(kernel, (contr_size, -1)),
                 )
-                x = ops.reshape(x, list(free_batch) + list(free_k_shape))
+                # Use ops.shape for dynamic batch dims (TF has None in
+                # static shape for unknown dims; ops.shape gives runtime values)
+                x = ops.reshape(
+                    x, list(ops.shape(inputs)[:n_free]) + list(free_k_shape)
+                )
                 if self.bias is not None:
                     x = ops.add(x, self.bias)
         else:

@@ -442,6 +442,8 @@ class Layer(BackendLayer, Operation):
         inference when none of the heavier framework features are active.
         Distribution and input-mask presence are checked at call time.
         """
+        # Cache quantization_mode so the hot path avoids the property lookup.
+        self._quantization_mode = self.quantization_mode
         self._fast_call = (
             self.activity_regularizer is None
             and not self._call_has_mask_arg
@@ -449,9 +451,9 @@ class Layer(BackendLayer, Operation):
             and self._convert_input_args
             and not self._allow_non_tensor_positional_args
             and self._mask_always_none
+            and self._quantization_mode is None
+            and self._remat_mode is None
         )
-        # Cache quantization_mode so the hot path avoids the property lookup.
-        self._quantization_mode = self.quantization_mode
 
     @property
     def _mask_always_none(self):

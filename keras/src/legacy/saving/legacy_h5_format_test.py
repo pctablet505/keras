@@ -200,7 +200,7 @@ class LegacyH5WholeModelTest(testing.TestCase):
         custom_layer = MyDense(1)
         model = models.Sequential(layers=[inputs, custom_layer])
 
-        ref_input = np.array([5])
+        ref_input = np.array([[5.0]])
         self._check_reloading_model(ref_input, model)
 
     def test_custom_functional_registered_no_scope(self):
@@ -427,7 +427,7 @@ class LegacyH5BackwardsCompatTest(testing.TestCase):
         custom_layer = MyDense(1)
         model = models.Sequential(layers=[inputs, custom_layer])
 
-        ref_input = np.array([5])
+        ref_input = np.array([[5.0]])
         self._check_reloading_model(ref_input, model, tf_keras_model)
 
     @pytest.mark.skipif(tf_keras is None, reason="Test requires tf_keras")

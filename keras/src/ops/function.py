@@ -1,4 +1,5 @@
 import collections
+import types
 
 from keras.src import tree
 from keras.src.api_export import keras_export
@@ -231,12 +232,31 @@ class Function(Operation):
             )
 
         output_slots = tuple(idx_map.get(id(x)) for x in self._outputs)
-        self._forward_plan = tuple(plan)
-        self._forward_plan_slots = next_idx
-        self._forward_output_slots = output_slots
-        self._forward_plan_single_output = len(output_slots) == 1
+        # Use object.__setattr__ to bypass Layer.__setattr__ and avoid routing
+        # these implementation-detail caches through the tracker.  This is safe
+        # because none of these hold Variables/Layers that need serialization.
+        # It also allows _compile_forward_plan() to be called after build()
+        # (e.g. from _execute_forward_plan for lazy recompilation) without
+        # triggering a tracker lock-violation error.
+        object.__setattr__(self, "_forward_plan", tuple(plan))
+        object.__setattr__(self, "_forward_plan_slots", next_idx)
+        object.__setattr__(self, "_forward_output_slots", output_slots)
+        object.__setattr__(
+            self, "_forward_plan_single_output", len(output_slots) == 1
+        )
         # Store idx_map for the general fallback path.
-        self._forward_idx_map = idx_map
+        object.__setattr__(self, "_forward_idx_map", idx_map)
+        # Track ops whose .call was baked in (pattern 1/2/3 bound-method
+        # entries) so we can detect plan staleness cheaply at runtime.
+        object.__setattr__(
+            self,
+            "_fast_plan_ops",
+            tuple(
+                fn.__self__
+                for fn, _, _, pattern, _, _ in plan
+                if pattern in (1, 2, 3) and isinstance(fn, types.MethodType)
+            ),
+        )
 
     def _execute_forward_plan(self, inputs, call_context_dict=None):
         """Execute the pre-compiled forward plan.
@@ -244,6 +264,12 @@ class Function(Operation):
         Uses a flat list with integer indexing for intermediate results,
         eliminating dict lookups, id() calls, and fill_in() overhead.
         """
+        # Pre-flight staleness check: if any `op.call`-baked entry has since
+        # had its _fast_call set to False (e.g. via quantize()/enable_lora()),
+        # recompile once so subsequent calls incur no overhead.
+        if any(not op._fast_call for op in self._fast_plan_ops):
+            self._compile_forward_plan()
+
         plan = self._forward_plan
         slots = [None] * self._forward_plan_slots
 
