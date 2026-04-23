@@ -14,7 +14,7 @@ ml-dtypes
 protobuf
 tensorboard
 tensorboard-plugin-profile
-etils<2.0.0
+etils
 rich
 build
 optree
