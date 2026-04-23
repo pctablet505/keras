@@ -1,3 +1,4 @@
+from keras.src import backend
 from keras.src import layers
 from keras.src import models
 from keras.src import tree
@@ -10,6 +11,7 @@ def export_litert(
     model,
     filepath,
     input_signature=None,
+    verbose=None,
     **kwargs,
 ):
     """Export the model as a LiteRT artifact for inference.
@@ -21,6 +23,20 @@ def export_litert(
             `None`, it will be inferred.
         **kwargs: Additional keyword arguments passed to the exporter.
     """
+    if backend.backend() == "torch":
+        return export_litert_via_torch(
+            model,
+            filepath,
+            input_signature=input_signature,
+            verbose=verbose,
+            **kwargs,
+        )
+
+    if backend.backend() != "tensorflow":
+        raise ImportError(
+            "The LiteRT export API is currently only available "
+            "with the TensorFlow and PyTorch backends."
+        )
 
     exporter = LiteRTExporter(
         model=model,
@@ -246,3 +262,374 @@ class LiteRTExporter:
                 setattr(converter, attr, value)
             else:
                 raise ValueError(f"Unknown converter attribute '{attr}'")
+
+
+def export_litert_via_torch(
+    model, filepath, input_signature=None, verbose=None, **kwargs
+):
+    """Export Keras model to LiteRT via PyTorch backend."""
+    try:
+        import litert_torch
+        import torch
+    except ImportError:
+        raise ImportError(
+            "To export to LiteRT with the PyTorch backend, "
+            "you must install the `litert-torch` package. "
+            "Install via: pip install litert-torch"
+        )
+
+    from keras.src.export.export_utils import convert_spec_to_tensor
+
+    original_devices = {}
+    _move_model_to_cpu(model, original_devices, torch)
+
+    from keras.src.backend.torch.core import device_scope
+
+    with device_scope("cpu"):
+        _register_litert_decompositions(torch, litert_torch)
+        _patch_vhlo_target_version()
+
+        if input_signature is None:
+            input_signature = get_input_signature(model)
+
+        sample_inputs = tree.map_structure(
+            lambda x: convert_spec_to_tensor(x, replace_none_number=1),
+            input_signature,
+        )
+        sample_inputs = tree.map_structure(
+            lambda t: t.cpu() if hasattr(t, "cpu") else t,
+            sample_inputs,
+        )
+        sample_inputs = tuple(sample_inputs)
+
+        if hasattr(model, "eval"):
+            model.eval()
+
+        litert_torch_kwargs = _prepare_litert_kwargs(kwargs, litert_torch)
+
+        try:
+            try:
+                edge_model = litert_torch.convert(
+                    model, sample_inputs, **litert_torch_kwargs
+                )
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to convert PyTorch model to LiteRT. "
+                    f"Common causes: unsupported operations, dynamic shapes, "
+                    f"or complex control flow. Original error: {e}"
+                ) from e
+
+            edge_model.export(filepath)
+        finally:
+            _restore_model_devices(model, original_devices, torch)
+
+    if verbose:
+        io_utils.print_msg(f"Saved LiteRT model to {filepath}")
+
+    return filepath
+
+
+def _prepare_litert_kwargs(kwargs, litert_torch):
+    """Prepare litert_torch conversion kwargs from user-provided arguments."""
+    litert_torch_kwargs = {}
+
+    valid_litert_torch_args = {
+        "strict_export",
+        "quant_config",
+        "dynamic_shapes",
+        "_ai_edge_converter_flags",
+        "_saved_model_dir",
+    }
+    for k, v in kwargs.items():
+        if k in valid_litert_torch_args:
+            litert_torch_kwargs[k] = v
+
+    if "optimizations" in kwargs and "quant_config" not in litert_torch_kwargs:
+        quant_cfg = _create_quant_config_from_optimizations(
+            kwargs["optimizations"], litert_torch
+        )
+        if quant_cfg is not None:
+            litert_torch_kwargs["quant_config"] = quant_cfg
+
+    return litert_torch_kwargs
+
+
+def _move_model_to_cpu(model, original_devices, torch):
+    """Move all model tensors to CPU for portable export."""
+    try:
+        for v in model.variables:
+            if hasattr(v, "value") and hasattr(v.value, "data"):
+                dev = str(v.value.device)
+                if dev != "cpu":
+                    original_devices[("var", v.path)] = dev
+                    v.value.data = v.value.data.to("cpu")
+    except (AttributeError, TypeError):
+        pass
+
+    try:
+        for name, p in model.named_parameters():
+            if p.device.type != "cpu":
+                original_devices[("param", name)] = str(p.device)
+                p.data = p.data.to("cpu")
+        for name, b in model.named_buffers():
+            if b.device.type != "cpu":
+                original_devices[("buffer", name)] = str(b.device)
+                b.data = b.data.to("cpu")
+    except (AttributeError, RuntimeError):
+        pass
+
+    try:
+        for layer in model._flatten_layers():
+            for attr_name in list(vars(layer)):
+                obj = getattr(layer, attr_name, None)
+                if (
+                    isinstance(obj, torch.Tensor)
+                    and not isinstance(obj, torch.nn.Parameter)
+                    and obj.device.type != "cpu"
+                ):
+                    key = ("attr", f"{layer.name}.{attr_name}")
+                    original_devices[key] = str(obj.device)
+                    setattr(layer, attr_name, obj.to("cpu"))
+    except (AttributeError, RuntimeError):
+        pass
+
+
+def _create_quant_config_from_optimizations(optimizations, litert_torch):
+    """Translate TFLite optimizations to litert_torch QuantConfig."""
+    if not optimizations:
+        return None
+
+    try:
+        from litert_torch.quantize.pt2e_quantizer import PT2EQuantizer
+        from litert_torch.quantize.pt2e_quantizer import (
+            get_symmetric_quantization_config,
+        )
+        from litert_torch.quantize.quant_config import QuantConfig
+    except ImportError:
+        io_utils.print_msg(
+            "Warning: litert_torch quantization modules not available. "
+            "Skipping quantization."
+        )
+        return None
+
+    try:
+        import tensorflow as tf
+
+        optimize_default = tf.lite.Optimize.DEFAULT
+        optimize_size = getattr(tf.lite.Optimize, "OPTIMIZE_FOR_SIZE", None)
+        optimize_latency = getattr(
+            tf.lite.Optimize, "OPTIMIZE_FOR_LATENCY", None
+        )
+    except (ImportError, AttributeError):
+        return None
+
+    has_default = optimize_default in optimizations
+    has_size = optimize_size and optimize_size in optimizations
+    has_latency = optimize_latency and optimize_latency in optimizations
+
+    if has_default or has_size or has_latency:
+        is_dynamic = has_default and not (has_size or has_latency)
+        is_per_channel = has_latency or has_size
+
+        quant_config_obj = get_symmetric_quantization_config(
+            is_per_channel=is_per_channel,
+            is_dynamic=is_dynamic,
+            is_qat=False,
+        )
+
+        quantizer = PT2EQuantizer()
+        quantizer.set_global(quant_config_obj)
+
+        return QuantConfig(pt2e_quantizer=quantizer)
+
+    return None
+
+
+def _restore_model_devices(model, original_devices, torch):
+    """Restore model tensors to their original devices after export."""
+    if not original_devices:
+        return
+
+    try:
+        for v in model.variables:
+            key = ("var", v.path)
+            if key in original_devices:
+                v.value.data = v.value.data.to(original_devices[key])
+    except (AttributeError, TypeError):
+        pass
+
+    try:
+        for name, p in model.named_parameters():
+            key = ("param", name)
+            if key in original_devices:
+                p.data = p.data.to(original_devices[key])
+        for name, b in model.named_buffers():
+            key = ("buffer", name)
+            if key in original_devices:
+                b.data = b.data.to(original_devices[key])
+    except (AttributeError, RuntimeError):
+        pass
+
+    try:
+        for layer in model._flatten_layers():
+            for attr_name in list(vars(layer)):
+                key = ("attr", f"{layer.name}.{attr_name}")
+                if key in original_devices:
+                    obj = getattr(layer, attr_name, None)
+                    if isinstance(obj, torch.Tensor):
+                        setattr(
+                            layer,
+                            attr_name,
+                            obj.to(original_devices[key]),
+                        )
+    except (AttributeError, RuntimeError):
+        pass
+
+
+def _register_litert_decompositions(torch, litert_torch):
+    """Register decompositions for operations unsupported by litert_torch."""
+    from litert_torch.fx_infra import decomp as litert_decomp
+
+    pre_convert = litert_decomp.pre_convert_decomp()
+
+    mps_sdpa = getattr(
+        torch.ops.aten,
+        "_scaled_dot_product_attention_math_for_mps",
+        None,
+    )
+    if mps_sdpa is not None:
+        mps_sdpa_default = getattr(mps_sdpa, "default", None)
+        if mps_sdpa_default is not None and mps_sdpa_default not in pre_convert:
+            non_mps_sdpa = getattr(
+                torch.ops.aten._scaled_dot_product_attention_math,
+                "default",
+                None,
+            )
+            if non_mps_sdpa is not None:
+                core_decomps = torch._decomp.core_aten_decompositions()
+                if non_mps_sdpa in core_decomps:
+                    litert_decomp.add_pre_convert_decomp(
+                        mps_sdpa_default, core_decomps[non_mps_sdpa]
+                    )
+
+    mean_dim_op = torch.ops.aten.mean.dim
+    if mean_dim_op not in pre_convert:
+
+        def _mean_dim_with_dtype(self, dim, keepdim=False, *, dtype=None):
+            if dtype is not None:
+                self = self.to(dtype)
+            curr_dim = dim
+            if curr_dim is None:
+                curr_dim = list(range(self.ndim))
+            elif isinstance(curr_dim, int):
+                curr_dim = [curr_dim]
+            count = 1
+            for d in curr_dim:
+                count *= self.shape[d]
+            return (
+                torch.ops.aten.sum.dim_IntList(self, curr_dim, keepdim=keepdim)
+                / count
+            )
+
+        litert_decomp.add_pre_convert_decomp(mean_dim_op, _mean_dim_with_dtype)
+
+    repeat_interleave_op = getattr(
+        torch.ops.aten.repeat_interleave, "Tensor", None
+    )
+    if (
+        repeat_interleave_op is not None
+        and repeat_interleave_op not in pre_convert
+    ):
+
+        def _repeat_interleave_decomp(repeats, output_size=None):
+            if output_size is None:
+                output_size = torch.ops.aten.sum.default(repeats)
+            boundaries = torch.ops.aten.cumsum.default(
+                repeats, dim=0, dtype=repeats.dtype
+            )
+            out_indices = torch.ops.aten.arange.start_step(
+                0, output_size, 1, dtype=repeats.dtype, device=repeats.device
+            )
+            return torch.ops.aten.searchsorted.default(
+                boundaries, out_indices, right=False
+            )
+
+        litert_decomp.add_pre_convert_decomp(
+            repeat_interleave_op, _repeat_interleave_decomp
+        )
+
+    repeat_interleave_self_int = getattr(
+        torch.ops.aten.repeat_interleave, "self_int", None
+    )
+    if (
+        repeat_interleave_self_int is not None
+        and repeat_interleave_self_int not in pre_convert
+    ):
+
+        def _repeat_interleave_self_int_decomp(
+            self, repeats, dim=None, *, output_size=None
+        ):
+            if dim is None:
+                self = self.flatten()
+                dim = 0
+            if dim < 0:
+                dim = self.ndim + dim
+            x = self.unsqueeze(dim + 1)
+            expand_shape = [-1] * x.ndim
+            expand_shape[dim + 1] = repeats
+            x = x.expand(expand_shape)
+            shape = list(self.shape)
+            shape[dim] = shape[dim] * repeats
+            return x.reshape(shape)
+
+        litert_decomp.add_pre_convert_decomp(
+            repeat_interleave_self_int, _repeat_interleave_self_int_decomp
+        )
+
+
+def _patch_vhlo_target_version():
+    """Patch VHLO serialization for TFLite converter compatibility."""
+    try:
+        from litert_torch.odml_torch import export as _odml_export
+
+        MlirLowered = _odml_export.MlirLowered
+        if getattr(MlirLowered, "_keras_vhlo_patched", False):
+            return
+
+        _serialize = _odml_export.serialize_portable_artifact
+        _stablehlo = _odml_export.stablehlo
+        _min_version = _stablehlo.get_minimum_version()
+
+        @property
+        def _patched_module_bytecode_vhlo(self):
+            _remove_optimization_barriers(self.module)
+            return _serialize(self.module_bytecode, _min_version)
+
+        MlirLowered.module_bytecode_vhlo = _patched_module_bytecode_vhlo
+        MlirLowered._keras_vhlo_patched = True
+    except (ImportError, AttributeError):
+        pass
+
+
+def _remove_optimization_barriers(module):
+    """Remove ``stablehlo.optimization_barrier`` ops from an MLIR module."""
+
+    def _walk_and_remove(region):
+        for block in region:
+            to_erase = []
+            for op in block:
+                for nested in op.regions:
+                    _walk_and_remove(nested)
+                if op.name == "stablehlo.optimization_barrier":
+                    for result, operand in zip(op.results, op.operands):
+                        result.replace_all_uses_with(operand)
+                    to_erase.append(op)
+            for op in reversed(to_erase):
+                op.erase()
+
+    try:
+        for op in module.body.operations:
+            for region in op.regions:
+                _walk_and_remove(region)
+    except (AttributeError, RuntimeError):
+        pass
