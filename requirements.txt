@@ -4,6 +4,7 @@
 tensorflow-cpu;sys_platform != 'darwin'
 tensorflow;sys_platform == 'darwin'
 ai-edge-litert
+litert-torch-nightly
 
 # Torch.
 --extra-index-url https://download.pytorch.org/whl/cpu

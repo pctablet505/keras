@@ -9,12 +9,9 @@ from keras.src import backend
 from keras.src import layers
 from keras.src import models
 from keras.src import testing
-from keras.src import tree
 
 
-# Skip helper utilities
 def _has_litert_torch():
-    """Check if litert-torch and torch are available."""
     try:
         import litert_torch  # noqa: F401
         import torch  # noqa: F401
@@ -25,7 +22,6 @@ def _has_litert_torch():
 
 
 def _get_interpreter(filepath):
-    """Return an allocated LiteRT interpreter for *filepath*."""
     from ai_edge_litert.interpreter import Interpreter
 
     interp = Interpreter(model_path=filepath)
@@ -34,7 +30,6 @@ def _get_interpreter(filepath):
 
 
 def _run_litert_inference(interpreter, input_arrays):
-    """Feed *input_arrays* (list of np arrays) through the interpreter."""
     input_details = interpreter.get_input_details()
     output_details = interpreter.get_output_details()
 
@@ -48,7 +43,6 @@ def _run_litert_inference(interpreter, input_arrays):
 
 
 def _to_numpy(x):
-    """Convert a Keras / torch tensor to numpy."""
     if hasattr(x, "detach"):
         return x.detach().cpu().numpy()
     return np.asarray(x)
@@ -61,37 +55,20 @@ def _to_numpy(x):
     not _has_litert_torch(), reason="Requires litert-torch and torch"
 )
 class LiteRTTorchExportTest(testing.TestCase):
-    """End-to-end tests: Keras → Torch (.pt2) → LiteRT (.tflite)."""
-
-    # Numerical tolerance for LiteRT conversion
     LITERT_ATOL = 1e-4
     TORCH_ATOL = 1e-5
 
     def _verify_litert_export(
         self, model, ref_input, filepath=None, **export_kwargs
     ):
-        """Helper to export model to LiteRT and verify numerical correctness.
-
-        Args:
-            model: Keras model to export.
-            ref_input: Input for inference (numpy array or list of arrays).
-            filepath: Optional export path. If None, uses temp file.
-            **export_kwargs: Additional arguments for model.export().
-
-        Returns:
-            tuple: (keras_output, litert_output) both as numpy arrays.
-        """
         if filepath is None:
             filepath = os.path.join(self.get_temp_dir(), "model.tflite")
 
-        # Get reference output
         keras_output = _to_numpy(model(ref_input))
 
-        # Export to LiteRT
         model.export(filepath, format="litert", **export_kwargs)
         self.assertTrue(os.path.exists(filepath))
 
-        # Run LiteRT inference
         input_arrays = ref_input if isinstance(ref_input, list) else [ref_input]
         litert_output = _run_litert_inference(
             _get_interpreter(filepath), input_arrays
@@ -102,7 +79,6 @@ class LiteRTTorchExportTest(testing.TestCase):
         return keras_output, litert_output
 
     def test_sequential_model(self):
-        """Test sequential model export to LiteRT."""
         model = models.Sequential(
             [
                 layers.Dense(16, activation="relu", input_shape=(10,)),
@@ -114,7 +90,6 @@ class LiteRTTorchExportTest(testing.TestCase):
         self._verify_litert_export(model, x)
 
     def test_functional_model(self):
-        """Test functional model export to LiteRT."""
         inp = layers.Input(shape=(10,))
         x = layers.Dense(16, activation="relu")(inp)
         out = layers.Dense(1)(x)
@@ -124,8 +99,6 @@ class LiteRTTorchExportTest(testing.TestCase):
         self._verify_litert_export(model, x)
 
     def test_subclass_model(self):
-        """Test subclass model export to LiteRT."""
-
         class TinyModel(models.Model):
             def __init__(self):
                 super().__init__()
@@ -142,7 +115,6 @@ class LiteRTTorchExportTest(testing.TestCase):
         self._verify_litert_export(model, x)
 
     def test_conv_model(self):
-        """Test convolutional model export to LiteRT."""
         model = models.Sequential(
             [
                 layers.Conv2D(8, 3, activation="relu", input_shape=(8, 8, 3)),
@@ -155,7 +127,6 @@ class LiteRTTorchExportTest(testing.TestCase):
         self._verify_litert_export(model, x)
 
     def test_multi_input_model(self):
-        """Test multi-input model export to LiteRT."""
         inp_a = layers.Input(shape=(10,), name="input_a")
         inp_b = layers.Input(shape=(10,), name="input_b")
         merged = layers.Concatenate()([inp_a, inp_b])
@@ -167,7 +138,6 @@ class LiteRTTorchExportTest(testing.TestCase):
         self._verify_litert_export(model, [a, b])
 
     def test_multi_output_model(self):
-        """Test multi-output model export to LiteRT."""
         inp = layers.Input(shape=(10,))
         x = layers.Dense(16, activation="relu")(inp)
         out_a = layers.Dense(1, name="out_a")(x)
@@ -190,7 +160,6 @@ class LiteRTTorchExportTest(testing.TestCase):
             litert_outs = [litert_outs]
 
         self.assertEqual(len(keras_outs), len(litert_outs))
-        # LiteRT may reorder outputs; match by shape and values
         for k_out in keras_outs:
             matched = False
             for l_out in litert_outs:
@@ -204,7 +173,6 @@ class LiteRTTorchExportTest(testing.TestCase):
             )
 
     def test_torch_export_numeric_parity(self):
-        """Verify Keras output == loaded .pt2 output (no LiteRT)."""
         import torch
 
         model = models.Sequential(
@@ -228,7 +196,6 @@ class LiteRTTorchExportTest(testing.TestCase):
         self.assertAllClose(keras_out, pt2_out, atol=self.TORCH_ATOL)
 
     def test_full_pipeline_numeric_parity(self):
-        """Verify Keras == Torch (.pt2) == LiteRT (.tflite)."""
         import torch
 
         model = models.Sequential(
@@ -247,7 +214,6 @@ class LiteRTTorchExportTest(testing.TestCase):
         x_np = np.random.normal(size=(1, 10)).astype("float32")
         keras_out = _to_numpy(model(x_np))
 
-        # Torch .pt2
         program = torch.export.load(pt2_path)
         module = program.module()
         device = next(module.parameters()).device
@@ -266,14 +232,9 @@ class LiteRTTorchExportTest(testing.TestCase):
         )
 
     def test_import_error_without_litert_torch(self):
-        """Test that missing litert-torch raises helpful ImportError."""
-        # This test is skipped when litert-torch is available (class decorator)
-        # The actual error is tested by mocking the import
         pytest.skip("Test requires litert-torch to be unavailable")
 
     def test_export_with_optimizations_default(self):
-        """Test TFLite optimizations parameter is translated to quant_config."""
-
         try:
             import tensorflow as tf
         except ImportError:
@@ -289,8 +250,6 @@ class LiteRTTorchExportTest(testing.TestCase):
 
         path = os.path.join(self.get_temp_dir(), "quantized.tflite")
 
-        # Export with TFLite-style optimizations parameter
-        # Should be translated to litert_torch quant_config
         model.export(
             path,
             format="litert",
