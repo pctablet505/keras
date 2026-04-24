@@ -1,6 +1,6 @@
 # Tensorflow cpu-only version (needed for testing).
 tensorflow-cpu
-litert-torch==0.9.0
+litert-torch>=0.9.0
 
 # Torch with cuda support.
 # - torch is pinned to a version that is compatible with torch-xla.

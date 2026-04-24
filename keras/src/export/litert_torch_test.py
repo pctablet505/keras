@@ -10,15 +10,36 @@ from keras.src import layers
 from keras.src import models
 from keras.src import testing
 
+# Importing `litert_torch` has the module-level side effect of calling
+# `jax.config.update("jax_enable_x64", True)` (from
+# `litert_torch/backend/jax_bridge/_wrap.py`). This pollutes the global JAX
+# configuration and would cause unrelated dtype tests in the same pytest
+# session to compare against `float64` JAX reference values instead of
+# `float32`. We perform the import here, save the original x64 setting, and
+# restore it immediately so that the rest of the test session sees the
+# original behavior. Tests in this file that actually need x64=True manage
+# it explicitly via setUp/tearDown.
+try:
+    import jax as _jax
+
+    _ORIG_JAX_X64 = _jax.config.jax_enable_x64
+except ImportError:
+    _jax = None
+    _ORIG_JAX_X64 = None
+
+try:
+    import litert_torch  # noqa: F401
+    import torch  # noqa: F401
+
+    _HAS_LITERT_TORCH = True
+    if _jax is not None:
+        _jax.config.update("jax_enable_x64", _ORIG_JAX_X64)
+except (ImportError, ModuleNotFoundError):
+    _HAS_LITERT_TORCH = False
+
 
 def _has_litert_torch():
-    try:
-        import litert_torch  # noqa: F401
-        import torch  # noqa: F401
-
-        return True
-    except (ImportError, ModuleNotFoundError):
-        return False
+    return _HAS_LITERT_TORCH
 
 
 def _get_interpreter(filepath):
@@ -57,6 +78,31 @@ def _to_numpy(x):
 class LiteRTTorchExportTest(testing.TestCase):
     LITERT_ATOL = 1e-4
     TORCH_ATOL = 1e-5
+
+    def setUp(self):
+        super().setUp()
+        # litert_torch requires jax_enable_x64=True to correctly generate
+        # StableHLO MLIR with i64/f64 tensors from JAX bridged lowerings.
+        # Save the prior value so tearDown can restore it exactly, rather
+        # than unconditionally forcing a particular value.
+        self._original_jax_x64 = None
+        try:
+            import jax
+
+            self._original_jax_x64 = jax.config.jax_enable_x64
+            jax.config.update("jax_enable_x64", True)
+        except ImportError:
+            pass
+
+    def tearDown(self):
+        super().tearDown()
+        if self._original_jax_x64 is not None:
+            try:
+                import jax
+
+                jax.config.update("jax_enable_x64", self._original_jax_x64)
+            except ImportError:
+                pass
 
     def _verify_litert_export(
         self, model, ref_input, filepath=None, **export_kwargs
