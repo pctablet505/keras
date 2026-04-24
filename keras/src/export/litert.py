@@ -287,7 +287,6 @@ def export_litert_via_torch(
 
     with device_scope("cpu"):
         _register_litert_decompositions(torch, litert_torch)
-        _patch_vhlo_target_version()
 
         if input_signature is None:
             input_signature = get_input_signature(model)
@@ -585,51 +584,3 @@ def _register_litert_decompositions(torch, litert_torch):
         litert_decomp.add_pre_convert_decomp(
             repeat_interleave_self_int, _repeat_interleave_self_int_decomp
         )
-
-
-def _patch_vhlo_target_version():
-    """Patch VHLO serialization for TFLite converter compatibility."""
-    try:
-        from litert_torch.odml_torch import export as _odml_export
-
-        MlirLowered = _odml_export.MlirLowered
-        if getattr(MlirLowered, "_keras_vhlo_patched", False):
-            return
-
-        _serialize = _odml_export.serialize_portable_artifact
-        _stablehlo = _odml_export.stablehlo
-        _min_version = _stablehlo.get_minimum_version()
-
-        @property
-        def _patched_module_bytecode_vhlo(self):
-            _remove_optimization_barriers(self.module)
-            return _serialize(self.module_bytecode, _min_version)
-
-        MlirLowered.module_bytecode_vhlo = _patched_module_bytecode_vhlo
-        MlirLowered._keras_vhlo_patched = True
-    except (ImportError, AttributeError):
-        pass
-
-
-def _remove_optimization_barriers(module):
-    """Remove ``stablehlo.optimization_barrier`` ops from an MLIR module."""
-
-    def _walk_and_remove(region):
-        for block in region:
-            to_erase = []
-            for op in block:
-                for nested in op.regions:
-                    _walk_and_remove(nested)
-                if op.name == "stablehlo.optimization_barrier":
-                    for result, operand in zip(op.results, op.operands):
-                        result.replace_all_uses_with(operand)
-                    to_erase.append(op)
-            for op in reversed(to_erase):
-                op.erase()
-
-    try:
-        for op in module.body.operations:
-            for region in op.regions:
-                _walk_and_remove(region)
-    except (AttributeError, RuntimeError):
-        pass
