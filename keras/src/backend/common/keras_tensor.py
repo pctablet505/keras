@@ -400,19 +400,11 @@ class KerasTensor:
 
 
 def any_symbolic_tensors(args=None, kwargs=None):
-    if args is not None:
-        for x in args:
+    for items in (args or (), kwargs.values() if kwargs else ()):
+        for x in items:
             if isinstance(x, KerasTensor):
                 return True
-            if isinstance(x, (list, tuple, dict)):
-                for nested in tree.flatten(x):
-                    if isinstance(nested, KerasTensor):
-                        return True
-    if kwargs is not None:
-        for x in kwargs.values():
-            if isinstance(x, KerasTensor):
-                return True
-            if isinstance(x, (list, tuple, dict)):
+            if tree.is_nested(x):
                 for nested in tree.flatten(x):
                     if isinstance(nested, KerasTensor):
                         return True

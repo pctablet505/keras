@@ -47,6 +47,9 @@ class Variable:
             to `"none"`.
         name: Optional. A unique name for the variable. Automatically generated
             if not set.
+        layout: Optional. Sharding layout for the variable. Can be a
+            `keras.distribution.TensorLayout` or a backend-specific layout.
+        kwargs: Additional backend-specific keyword arguments.
 
     Attributes:
         shape: The shape of the variable (tuple of integers).
@@ -58,7 +61,6 @@ class Variable:
         value: The current value of the variable (NumPy array or tensor).
         name: The name of the variable (string).
         path: The path of the variable within the Keras model or layer (string).
-        kwargs: Additional backend-specific keyword arguments.
 
     Examples:
 
@@ -106,9 +108,9 @@ class Variable:
         aggregation="none",
         synchronization="auto",
         name=None,
+        layout=None,
         **kwargs,
     ):
-        del kwargs
         name = name or auto_name(self.__class__.__name__)
         if not isinstance(name, str) or "/" in name:
             raise ValueError(
@@ -160,6 +162,8 @@ class Variable:
         self._autocast = bool(autocast)
         self._aggregation = aggregation
         self._synchronization = synchronization
+        self._layout = layout
+
         # `self._overwrite_with_gradient` is an internal property to determine
         # whether this variable should be overwritten by the computed gradient.
         # Ref: https://github.com/google/flax/blob/main/flax/linen/fp8_ops.py
@@ -393,13 +397,11 @@ class Variable:
 
     @constraint.setter
     def constraint(self, value):
-        from keras.src.constraints import Constraint
-
-        if value is not None and not isinstance(value, Constraint):
+        if value is not None and not callable(value):
             raise ValueError(
-                "Invalid value for attribute `constraint`. Expected an "
-                "instance of `keras.constraints.Constraint`, or `None`. "
-                f"Received: constraint={value}"
+                "Invalid value for attribute `constraint`. Expected a "
+                "callable (such as a `keras.constraints.Constraint` instance) "
+                f"or `None`. Received: constraint={value}"
             )
         self._constraint = value
 

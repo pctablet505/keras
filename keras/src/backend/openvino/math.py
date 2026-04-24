@@ -122,10 +122,9 @@ def top_k(x, k, sorted=True):
 def in_top_k(targets, predictions, k):
     from keras.src.backend.openvino.numpy import take_along_axis
 
+    one_constant = ov_opset.constant(1, Type.i32)
     # Expand targets: (batch,) → (batch, 1) for use with take_along_axis
-    targets = ov_opset.unsqueeze(
-        get_ov_output(targets), ov_opset.constant(1, Type.i32)
-    ).output(0)
+    targets = ov_opset.unsqueeze(get_ov_output(targets), one_constant).output(0)
     predictions = get_ov_output(predictions)
 
     # top_k returns (batch, k) sorted descending; last col is the k-th largest
@@ -136,9 +135,13 @@ def in_top_k(targets, predictions, k):
     topk_min = ov_opset.gather(
         topk_values, k_minus_1_idx, topk_values_axis
     ).output(0)
+    # Squeeze back (batch, 1) → (batch,)
+    topk_min = ov_opset.squeeze(topk_min, one_constant).output(0)
 
     # Gather the prediction score at each true class index → shape (batch, 1)
     targets_values = take_along_axis(predictions, targets, axis=-1)
+    # Squeeze back (batch, 1) → (batch,)
+    targets_values = ov_opset.squeeze(targets_values, one_constant).output(0)
     # target score >= k-th largest score means it belongs in the top-k
     mask = ov_opset.greater_equal(targets_values, topk_min).output(0)
     return OpenVINOKerasTensor(mask)
@@ -167,10 +170,6 @@ def logsumexp(x, axis=None, keepdims=False):
         norm_max = ov_opset.squeeze(norm_max, axis).output(0)
     log_sum_exp = ov_opset.add(norm_max, log_sum_exp).output(0)
     return OpenVINOKerasTensor(log_sum_exp)
-
-
-def qr(x, mode="reduced"):
-    raise NotImplementedError("`qr` is not supported with openvino backend")
 
 
 def extract_sequences(x, sequence_length, sequence_stride):
@@ -824,3 +823,9 @@ def erfinv(x):
     ).output(0)
 
     return OpenVINOKerasTensor(y1)
+
+
+def logdet(x):
+    from keras.src.backend.openvino.numpy import slogdet
+
+    return slogdet(x)[1]
