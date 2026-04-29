@@ -385,6 +385,21 @@ class ExportTorchTest(testing.TestCase):
 
         self._verify_export_and_inference(model, ref_input)
 
+    def test_export_with_dynamic_slice_update(self):
+        """slice_update with tensor start_indices is torch.export traceable."""
+
+        class DynamicSliceUpdateModel(models.Model):
+            def call(self, x):
+                start = ops.convert_to_tensor([0, 2])
+                update = ops.slice(x, [0, 0], [1, 2])
+                return ops.slice_update(x, start, update)
+
+        model = DynamicSliceUpdateModel()
+        ref_input = np.random.normal(size=(1, 4)).astype("float32")
+        model(ref_input)
+
+        self._verify_export_and_inference(model, ref_input)
+
     def test_export_with_concrete_shapes(self):
         model = models.Sequential([layers.Dense(1, input_shape=(5,))])
         temp_filepath = os.path.join(self.get_temp_dir(), "concrete_shapes.pt2")
