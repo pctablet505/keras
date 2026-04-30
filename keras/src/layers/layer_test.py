@@ -1770,6 +1770,10 @@ class LayerTest(testing.TestCase):
         self.assertEqual(dict(counters["stats"]), stats_after_warmup)
         self.assertEqual(dict(counters["frames"]), frames_after_warmup)
 
+    @pytest.mark.skipif(
+        not backend.SUPPORTS_COMPLEX_DTYPES,
+        reason=f"{backend.backend()} backend doesn't support complex dtypes.",
+    )
     def test_complex_dtype_support(self):
         class MyDenseLayer(layers.Layer):
             def __init__(self, num_outputs):

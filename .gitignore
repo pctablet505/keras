@@ -24,5 +24,3 @@ examples/**/*.jpg
 
 pytest.ini
 venv/
-/bench_results
-/benchmarks
