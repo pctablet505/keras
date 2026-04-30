@@ -1132,6 +1132,49 @@ class SavingBattleTest(testing.TestCase):
         out = new_model(x)
         self.assertAllClose(out, ref_out)
 
+    def test_custom_subclass_weight_loading(self):
+        """Test that weights saved from a custom subclass can be loaded
+        into a model using the base class, and vice versa (issue #20322).
+        """
+
+        @keras.saving.register_keras_serializable(package="custom_lstm_test")
+        class CustomLSTM(keras.layers.LSTM):
+            pass
+
+        # Build model with custom LSTM subclass
+        inputs_a = keras.Input(shape=(10, 1))
+        lstm_a = CustomLSTM(32, name="my_lstm")
+        dense_a = keras.layers.Dense(1, name="output")
+        model_a = keras.Model(
+            inputs_a, dense_a(lstm_a(inputs_a)), name="model_a"
+        )
+
+        # Build model with vanilla LSTM (same layer name)
+        inputs_b = keras.Input(shape=(10, 1))
+        lstm_b = keras.layers.LSTM(32, name="my_lstm")
+        dense_b = keras.layers.Dense(1, name="output")
+        model_b = keras.Model(
+            inputs_b, dense_b(lstm_b(inputs_b)), name="model_b"
+        )
+
+        x = np.random.random((1, 10, 1)).astype("float32")
+
+        # Test custom -> base
+        temp_filepath = os.path.join(
+            self.get_temp_dir(), "custom_lstm.weights.h5"
+        )
+        model_a.save_weights(temp_filepath)
+        model_b.load_weights(temp_filepath)
+        self.assertAllClose(model_a(x), model_b(x))
+
+        # Test base -> custom
+        temp_filepath_2 = os.path.join(
+            self.get_temp_dir(), "vanilla_lstm.weights.h5"
+        )
+        model_b.save_weights(temp_filepath_2)
+        model_a.load_weights(temp_filepath_2)
+        self.assertAllClose(model_a(x), model_b(x))
+
     def test_remove_weights_only_saving_and_loading(self):
         def is_remote_path(path):
             return True
