@@ -195,6 +195,8 @@ class TensorBoard(Callback):
         self._init_profile_batch(profile_batch)
         self._global_train_batch = 0
         self._global_test_batch = 0
+        self._train_step_var = None
+        self._test_step_var = None
         self._previous_epoch_iterations = 0
         self._train_accumulated_time = 0
         self._batch_start_time = 0
@@ -406,7 +408,12 @@ class TensorBoard(Callback):
     def on_train_begin(self, logs=None):
         self._global_train_batch = 0
         self._previous_epoch_iterations = 0
-        self._push_writer(self._train_writer, self._global_train_batch)
+        if self._train_step_var is None:
+            self._train_step_var = backend.Variable(
+                0, dtype="int64", trainable=False
+            )
+        self._train_step_var.assign(0)
+        self._push_writer(self._train_writer, self._train_step_var)
 
     def on_train_end(self, logs=None):
         self._pop_writer()
@@ -417,7 +424,12 @@ class TensorBoard(Callback):
         self._close_writers()
 
     def on_test_begin(self, logs=None):
-        self._push_writer(self._val_writer, self._global_test_batch)
+        if self._test_step_var is None:
+            self._test_step_var = backend.Variable(
+                0, dtype="int64", trainable=False
+            )
+        self._test_step_var.assign(0)
+        self._push_writer(self._val_writer, self._test_step_var)
 
     def on_test_end(self, logs=None):
         if self.model.optimizer and hasattr(self.model.optimizer, "iterations"):
@@ -432,6 +444,8 @@ class TensorBoard(Callback):
 
     def on_train_batch_begin(self, batch, logs=None):
         self._global_train_batch += 1
+        if self._train_step_var is not None:
+            self._train_step_var.assign(self._global_train_batch)
         if self.write_steps_per_second:
             self._batch_start_time = time.time()
         if not self._should_trace:
@@ -475,6 +489,8 @@ class TensorBoard(Callback):
 
     def on_test_batch_begin(self, batch, logs=None):
         self._global_test_batch += 1
+        if self._test_step_var is not None:
+            self._test_step_var.assign(self._global_test_batch)
 
     def on_epoch_begin(self, epoch, logs=None):
         # Keeps track of epoch for profiling.
