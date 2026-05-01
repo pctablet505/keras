@@ -1142,11 +1142,14 @@ def blackman(x):
     x = tf.cast(x, dtype)
     n = tf.range(x, dtype=dtype)
     n_minus_1 = tf.cast(x - 1, dtype)
+    n_minus_1_safe = tf.where(
+        tf.equal(n_minus_1, 0), tf.ones_like(n_minus_1), n_minus_1
+    )
     term1 = 0.42
-    term2 = -0.5 * tf.cos(2 * np.pi * n / n_minus_1)
-    term3 = 0.08 * tf.cos(4 * np.pi * n / n_minus_1)
+    term2 = -0.5 * tf.cos(2 * np.pi * n / n_minus_1_safe)
+    term3 = 0.08 * tf.cos(4 * np.pi * n / n_minus_1_safe)
     window = term1 + term2 + term3
-    return window
+    return tf.where(tf.equal(n_minus_1, 0), tf.ones_like(window), window)
 
 
 def broadcast_to(x, shape):
@@ -1588,9 +1591,13 @@ def expm1(x):
 
 def flip(x, axis=None):
     x = convert_to_tensor(x)
+    rank = x.shape.rank
     if axis is None:
-        return tf.reverse(x, tf.range(tf.rank(x)))
-    return tf.reverse(x, [axis])
+        return tf.reverse(x, tf.range(rank))
+    else:
+        axis = to_tuple_or_list(axis)
+        axis = [canonicalize_axis(a, rank) for a in axis]
+        return tf.reverse(x, axis)
 
 
 def fliplr(x):
@@ -2337,6 +2344,15 @@ def nanmean(x, axis=None, keepdims=False):
     return tf.divide(total_sum, normalizer)
 
 
+def nanmedian(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+
+    if axis == () or axis == []:
+        return x
+
+    return nanquantile(x, q=0.5, axis=axis, keepdims=keepdims)
+
+
 def nanmin(x, axis=None, keepdims=False):
     x = convert_to_tensor(x)
 
@@ -2355,6 +2371,12 @@ def nanmin(x, axis=None, keepdims=False):
         tf.constant(float("nan"), dtype=x.dtype),
         tf.reduce_min(x_clean, axis=axis, keepdims=keepdims),
     )
+
+
+def nanpercentile(x, q, axis=None, method="linear", keepdims=False):
+    x = convert_to_tensor(x)
+    q = convert_to_tensor(q, dtype=config.floatx()) / 100.0
+    return nanquantile(x, q, axis=axis, method=method, keepdims=keepdims)
 
 
 def nanprod(x, axis=None, keepdims=False):
@@ -2553,6 +2575,12 @@ def pad(x, pad_width, mode="constant", constant_values=None):
         kwargs["constant_values"] = constant_values
     pad_width = convert_to_tensor(pad_width, "int32")
     return tf.pad(x, pad_width, mode.upper(), **kwargs)
+
+
+def percentile(x, q, axis=None, method="linear", keepdims=False):
+    x = convert_to_tensor(x)
+    q = convert_to_tensor(q, dtype=config.floatx()) / 100.0
+    return quantile(x, q, axis=axis, method=method, keepdims=keepdims)
 
 
 def prod(x, axis=None, keepdims=False, dtype=None):
@@ -2867,6 +2895,10 @@ def sort(x, axis=-1):
     x = convert_to_tensor(x)
     ori_dtype = standardize_dtype(x.dtype)
     # TODO: tf.sort doesn't support bool
+    if axis is None:
+        x = tf.reshape(x, [-1])
+        axis = 0
+
     if ori_dtype == "bool":
         x = tf.cast(x, "int8")
         return tf.cast(tf.sort(x, axis=axis), ori_dtype)
@@ -3458,6 +3490,8 @@ def transpose(x, axes=None):
         output = tf.sparse.transpose(x, perm=axes)
         output.set_shape(compute_transpose_output_shape(x.shape, axes))
         return output
+    if axes:
+        axes = tuple(canonicalize_axis(axis, len(x.shape)) for axis in axes)
     return tf.transpose(x, perm=axes)
 
 
@@ -3741,3 +3775,105 @@ def histogram(x, bins=10, range=None):
         shape=(bins,),
     )
     return bin_counts, bin_edges
+
+
+def unique(
+    x,
+    sorted=True,
+    return_inverse=False,
+    return_counts=False,
+    axis=None,
+    size=None,
+    fill_value=None,
+):
+    x = tf.convert_to_tensor(x)
+    is_flatten = axis is None
+    original_shape = tf.shape(x)
+
+    if is_flatten:
+        x = tf.reshape(x, [-1])
+        dim = 0
+        y, inverse, counts = tf.unique_with_counts(x)
+
+    else:
+        ndim = x.shape.rank
+        dim = axis + ndim if axis < 0 else axis
+        axis_to_use = tf.constant([dim], dtype=tf.int32)
+        y, inverse, counts = tf.raw_ops.UniqueWithCountsV2(
+            x=x, axis=axis_to_use, out_idx=tf.int32
+        )
+
+    if sorted:
+        num_unique = tf.shape(y)[dim]
+        if is_flatten or y.shape.rank == 1:
+            sort_order = tf.argsort(y)
+        else:
+            # Multi-D lexicographical sort
+            perm = list(range(y.shape.rank))
+            perm[0], perm[dim] = perm[dim], perm[0]
+            y_transposed = tf.transpose(y, perm)
+            y_2d = tf.reshape(y_transposed, [num_unique, -1])
+            num_cols = tf.shape(y_2d)[1]
+
+            sort_order = tf.range(num_unique, dtype=tf.int32)
+
+            def body(i, current_indices):
+                col = tf.gather(y_2d[:, i], current_indices)
+                perm_sort = tf.argsort(col, stable=True)
+                return i - 1, tf.gather(current_indices, perm_sort)
+
+            def cond(i, current_indices):
+                return i >= 0
+
+            _, sort_order = tf.while_loop(
+                cond, body, [num_cols - 1, sort_order], parallel_iterations=1
+            )
+
+        y = tf.gather(y, sort_order, axis=dim)
+        if return_counts:
+            counts = tf.gather(counts, sort_order)
+        if return_inverse:
+            # Must invert permutation to map inverse indices correctly
+            inv_perm = tf.math.invert_permutation(sort_order)
+            inverse = tf.gather(inv_perm, inverse)
+
+    # Static size padding/truncation (branchless logic for graph mode safety)
+    if size is not None:
+        values_count = tf.shape(y)[dim]
+
+        # 1. Truncate using gather
+        truncate_size = tf.minimum(values_count, size)
+        y = tf.gather(y, tf.range(truncate_size), axis=dim)
+        if return_counts:
+            counts = tf.gather(counts, tf.range(truncate_size))
+
+        # 2. Pad using tf.pad (pad_amount = 0 makes it a no-op)
+        pad_amount = tf.maximum(0, size - values_count)
+        paddings = tf.zeros([tf.rank(y), 2], dtype=tf.int32)
+        paddings = tf.tensor_scatter_nd_update(
+            paddings, [[dim, 1]], [pad_amount]
+        )
+
+        fill = tf.cast(0 if fill_value is None else fill_value, y.dtype)
+        y = tf.pad(y, paddings, constant_values=fill)
+
+        if return_counts:
+            counts = tf.pad(counts, [[0, pad_amount]], constant_values=0)
+
+        # 3. Enforce static shape for JAX/XLA compatibility
+        static_shape = y.shape.as_list()
+        static_shape[dim] = size
+        y.set_shape(static_shape)
+        if return_counts:
+            counts.set_shape([size])
+
+    if return_inverse and is_flatten:
+        inverse = tf.reshape(inverse, original_shape)
+
+    results = [y]
+    if return_inverse:
+        results.append(inverse)
+    if return_counts:
+        results.append(counts)
+
+    return tuple(results) if len(results) > 1 else results[0]

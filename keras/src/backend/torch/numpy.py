@@ -1436,6 +1436,15 @@ def nanmean(x, axis=None, keepdims=False):
     return torch.nanmean(cast(x, dtype), dim=axis, keepdim=keepdims)
 
 
+def nanmedian(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+
+    if axis == () or axis == []:
+        return x
+
+    return nanquantile(x, q=0.5, axis=axis, keepdims=keepdims)
+
+
 def nanmin(x, axis=None, keepdims=False):
     x = convert_to_tensor(x)
     if not torch.is_floating_point(x):
@@ -1452,6 +1461,12 @@ def nanmin(x, axis=None, keepdims=False):
         torch.tensor(float("nan"), dtype=x.dtype, device=get_device()),
         out,
     )
+
+
+def nanpercentile(x, q, axis=None, method="linear", keepdims=False):
+    x = convert_to_tensor(x)
+    q = convert_to_tensor(q, dtype=config.floatx()) / 100.0
+    return nanquantile(x, q, axis=axis, method=method, keepdims=keepdims)
 
 
 def nanprod(x, axis=None, keepdims=False):
@@ -1636,6 +1651,12 @@ def pad(x, pad_width, mode="constant", constant_values=None):
     return x
 
 
+def percentile(x, q, axis=None, method="linear", keepdims=False):
+    x = convert_to_tensor(x)
+    q = convert_to_tensor(q, dtype=config.floatx()) / 100.0
+    return quantile(x, q, axis=axis, method=method, keepdims=keepdims)
+
+
 def prod(x, axis=None, keepdims=False, dtype=None):
     x = convert_to_tensor(x)
     if dtype is None:
@@ -1757,6 +1778,23 @@ def repeat(x, repeats, axis=None):
             device=get_device(),
         )
 
+    # When repeats is a scalar int and axis is specified, use
+    # unsqueeze + expand + reshape instead of repeat_interleave.
+    # repeat_interleave introduces unbacked symbolic integers during
+    # torch.export tracing, preventing static shape inference. This
+    # alternative preserves static output shapes.
+    if isinstance(repeats, int) and axis is not None:
+        if axis < 0:
+            axis = x.ndim + axis
+        shape = list(x.shape)
+        x = x.unsqueeze(axis + 1)
+        expand_shape = [-1] * x.ndim
+        expand_shape[axis + 1] = repeats
+        x = x.expand(expand_shape)
+        new_shape = list(shape)
+        new_shape[axis] = shape[axis] * repeats
+        return x.reshape(new_shape)
+
     repeats = convert_to_tensor(repeats, dtype=int)
 
     return torch.repeat_interleave(x, repeats, dim=axis)
@@ -1820,6 +1858,9 @@ def size(x):
 
 def sort(x, axis=-1):
     x = convert_to_tensor(x)
+    if axis is None:
+        x = x.reshape(-1)
+        axis = 0
     # TODO: torch.sort doesn't support bool with cuda
     if get_device() == "cuda" and standardize_dtype(x.dtype) == "bool":
         x = cast(x, "uint8")
@@ -2067,7 +2108,8 @@ def where(condition, x1=None, x2=None):
         x2 = convert_to_tensor(x2)
         return torch.where(condition, x1, x2)
     else:
-        return torch.where(condition)
+        # `torch.where(condition)` returns a tuple of tensors.
+        return torch.stack(torch.where(condition), dim=0)
 
 
 def divide(x1, x2):
@@ -2315,3 +2357,60 @@ def argpartition(x, kth, axis=-1):
 def histogram(x, bins=10, range=None):
     hist_result = torch.histogram(x, bins=bins, range=range)
     return hist_result.hist, hist_result.bin_edges
+
+
+def unique(
+    x,
+    sorted=True,
+    return_inverse=False,
+    return_counts=False,
+    axis=None,
+    size=None,
+    fill_value=None,
+):
+    if not isinstance(x, torch.Tensor):
+        x = torch.as_tensor(x)
+
+    output = torch.unique(
+        x,
+        sorted=sorted,  # Added sorted parameter here
+        return_inverse=return_inverse,
+        return_counts=return_counts,
+        dim=axis,
+    )
+
+    if not (return_inverse or return_counts):
+        output = [output]
+    else:
+        output = list(output)
+
+    values = output[0]
+
+    if size is not None:
+        dim = axis if axis is not None else 0
+        values_count = values.shape[dim]
+
+        if values_count > size:
+            # Truncate
+            indices = [slice(None)] * values.ndim
+            indices[dim] = slice(0, size)
+            values = values[tuple(indices)]
+            if return_counts:
+                output[-1] = output[-1][tuple(indices)]
+
+        elif values_count < size:
+            # Pad
+            diff = size - values_count
+            pad_width = [0, 0] * values.ndim
+            # F.pad expects padding from last dim to first
+            idx = (values.ndim - 1 - dim) * 2
+            pad_width[idx + 1] = diff
+            fill = 0 if fill_value is None else fill_value
+            values = torch.nn.functional.pad(values, pad_width, value=fill)
+            if return_counts:
+                output[-1] = torch.nn.functional.pad(
+                    output[-1], pad_width, value=0
+                )
+
+    output[0] = values
+    return output[0] if len(output) == 1 else tuple(output)

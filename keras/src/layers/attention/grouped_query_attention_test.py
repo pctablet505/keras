@@ -19,8 +19,8 @@ class GroupedQueryAttentionTest(testing.TestCase):
         disable_flash_attention()
 
     def tearDown(self):
+        super().tearDown()
         enable_flash_attention()
-        return super().tearDown()
 
     def test_basics(self):
         self.assertFalse(is_flash_attention_enabled())
@@ -239,6 +239,31 @@ class GroupedQueryAttentionTest(testing.TestCase):
         with self.assertRaisesRegex(ValueError, r"must be equal"):
             layer.compute_output_shape(query_shape, value_shape, key_shape)
 
+    def test_symbolic_shape_with_return_attention_scores(self):
+        layer = layers.GroupedQueryAttention(
+            num_query_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+        )
+        query = layers.Input(shape=(10, 32))
+        value = layers.Input(shape=(15, 32))
+
+        output, scores = layer(query, value, return_attention_scores=True)
+        self.assertEqual(output.shape, (None, 10, 32))
+        self.assertEqual(scores.shape, (None, 4, 10, 15))
+
+    def test_symbolic_shape_without_return_attention_scores(self):
+        layer = layers.GroupedQueryAttention(
+            num_query_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+        )
+        query = layers.Input(shape=(10, 32))
+        value = layers.Input(shape=(15, 32))
+
+        output = layer(query, value)
+        self.assertEqual(output.shape, (None, 10, 32))
+
     def test_initializer(self):
         # Test with a specified initializer.
         layer = layers.GroupedQueryAttention(
@@ -269,10 +294,6 @@ class GroupedQueryAttentionTest(testing.TestCase):
             layer._gate_dense.kernel,
         )
 
-    @pytest.mark.skipif(
-        backend.backend() == "numpy",
-        reason="Numpy backend does not support masking.",
-    )
     def test_query_mask_propagation(self):
         """Test automatic propagation of the query's mask."""
         layer = layers.GroupedQueryAttention(
@@ -283,7 +304,9 @@ class GroupedQueryAttentionTest(testing.TestCase):
         masked_query = layers.Embedding(4, 8, mask_zero=True)(query)
         value = np.random.normal(size=(3, 3, 8))
         output = layer(query=masked_query, value=value)
-        self.assertAllClose(masked_query._keras_mask, output._keras_mask)
+        self.assertAllClose(
+            backend.get_keras_mask(masked_query), backend.get_keras_mask(output)
+        )
 
         layer = layers.GroupedQueryAttention(
             num_query_heads=2, num_key_value_heads=2, head_dim=2, use_gate=True
@@ -293,13 +316,11 @@ class GroupedQueryAttentionTest(testing.TestCase):
         masked_query = layers.Embedding(4, 8, mask_zero=True)(query)
         value = np.random.normal(size=(3, 3, 8))
         output = layer(query=masked_query, value=value)
-        self.assertAllClose(masked_query._keras_mask, output._keras_mask)
+        self.assertAllClose(
+            backend.get_keras_mask(masked_query), backend.get_keras_mask(output)
+        )
 
     @parameterized.named_parameters(("causal", True), ("not_causal", 0))
-    @pytest.mark.skipif(
-        backend.backend() == "numpy",
-        reason="Numpy backend does not support masking.",
-    )
     def test_masking(self, use_causal_mask):
         """Test that the value and causal masks are taken into account."""
         layer = layers.GroupedQueryAttention(
@@ -323,8 +344,8 @@ class GroupedQueryAttentionTest(testing.TestCase):
             mask = mask & np.array(
                 [[[1, 0, 0], [1, 1, 0]] + [[1, 1, 1]] * 3]
             ).astype(bool)
-        del masked_query._keras_mask
-        del masked_value._keras_mask
+        backend.set_keras_mask(masked_query, None)
+        backend.set_keras_mask(masked_value, None)
         output_with_manual_mask = layer(
             query=masked_query, value=masked_value, attention_mask=mask
         )
@@ -351,8 +372,8 @@ class GroupedQueryAttentionTest(testing.TestCase):
             mask = mask & np.array(
                 [[[1, 0, 0], [1, 1, 0]] + [[1, 1, 1]] * 3]
             ).astype(bool)
-        del masked_query._keras_mask
-        del masked_value._keras_mask
+        backend.set_keras_mask(masked_query, None)
+        backend.set_keras_mask(masked_value, None)
         output_with_manual_mask = layer(
             query=masked_query, value=masked_value, attention_mask=mask
         )
