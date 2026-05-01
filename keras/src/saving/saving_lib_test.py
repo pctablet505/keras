@@ -1132,6 +1132,171 @@ class SavingBattleTest(testing.TestCase):
         out = new_model(x)
         self.assertAllClose(out, ref_out)
 
+    def test_nested_list_layer_saving(self):
+        """Test that layers stored in nested lists are saved/loaded."""
+
+        @keras.saving.register_keras_serializable(package="test_nested_list")
+        class NestedListBlockModel(keras.Model):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.blocks = [
+                    [keras.layers.Dense(8), keras.layers.Dense(8)],
+                    [keras.layers.Dense(8), keras.layers.Dense(8)],
+                ]
+                self.out_layer = keras.layers.Dense(2)
+
+            def call(self, x):
+                for block in self.blocks:
+                    for layer in block:
+                        x = layer(x)
+                return self.out_layer(x)
+
+            def get_config(self):
+                return super().get_config()
+
+        model = NestedListBlockModel()
+        x = np.random.random((2, 4))
+        model(x)  # build weights
+
+        # Assign distinct constant kernels so that any layer-swapping
+        # on reload would produce a detectable mismatch.
+        for i, block in enumerate(model.blocks):
+            for j, layer in enumerate(block):
+                val = float(i * 2 + j + 1)  # 1.0, 2.0, 3.0, 4.0
+                layer.kernel.assign(np.full_like(layer.kernel, val))
+                layer.bias.assign(np.zeros_like(layer.bias))
+
+        ref_out = model(x)
+        temp_filepath = os.path.join(self.get_temp_dir(), "nested_list.keras")
+        model.save(temp_filepath)
+        new_model = keras.saving.load_model(temp_filepath)
+
+        # Verify each nested layer's weights were individually restored.
+        for i, (orig_block, new_block) in enumerate(
+            zip(model.blocks, new_model.blocks)
+        ):
+            for j, (orig_layer, new_layer) in enumerate(
+                zip(orig_block, new_block)
+            ):
+                self.assertAllClose(
+                    orig_layer.kernel,
+                    new_layer.kernel,
+                    msg=f"Kernel mismatch at blocks[{i}][{j}]",
+                )
+
+        out = new_model(x)
+        self.assertAllClose(ref_out, out)
+
+    def test_nested_tuple_layer_saving(self):
+        """Test that layers stored in nested tuples are saved/loaded."""
+
+        @keras.saving.register_keras_serializable(package="test_nested_tuple")
+        class NestedTupleBlockModel(keras.Model):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.blocks = (
+                    (keras.layers.Dense(8), keras.layers.Dense(8)),
+                    (keras.layers.Dense(8), keras.layers.Dense(8)),
+                )
+                self.out_layer = keras.layers.Dense(2)
+
+            def call(self, x):
+                for block in self.blocks:
+                    for layer in block:
+                        x = layer(x)
+                return self.out_layer(x)
+
+            def get_config(self):
+                return super().get_config()
+
+        model = NestedTupleBlockModel()
+        x = np.random.random((2, 4))
+        model(x)  # build weights
+
+        for i, block in enumerate(model.blocks):
+            for j, layer in enumerate(block):
+                val = float(i * 2 + j + 1)
+                layer.kernel.assign(np.full_like(layer.kernel, val))
+                layer.bias.assign(np.zeros_like(layer.bias))
+
+        ref_out = model(x)
+        temp_filepath = os.path.join(self.get_temp_dir(), "nested_tuple.keras")
+        model.save(temp_filepath)
+        new_model = keras.saving.load_model(temp_filepath)
+
+        for i, (orig_block, new_block) in enumerate(
+            zip(model.blocks, new_model.blocks)
+        ):
+            for j, (orig_layer, new_layer) in enumerate(
+                zip(orig_block, new_block)
+            ):
+                self.assertAllClose(
+                    orig_layer.kernel,
+                    new_layer.kernel,
+                    msg=f"Kernel mismatch at blocks[{i}][{j}]",
+                )
+
+        out = new_model(x)
+        self.assertAllClose(ref_out, out)
+
+    def test_nested_dict_layer_saving(self):
+        """Test that layers stored in nested dicts are saved/loaded."""
+
+        @keras.saving.register_keras_serializable(package="test_nested_dict")
+        class NestedDictBlockModel(keras.Model):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.blocks = {
+                    "block_a": [
+                        keras.layers.Dense(8),
+                        keras.layers.Dense(8),
+                    ],
+                    "block_b": [
+                        keras.layers.Dense(8),
+                        keras.layers.Dense(8),
+                    ],
+                }
+                self.out_layer = keras.layers.Dense(2)
+
+            def call(self, x):
+                for block in self.blocks.values():
+                    for layer in block:
+                        x = layer(x)
+                return self.out_layer(x)
+
+            def get_config(self):
+                return super().get_config()
+
+        model = NestedDictBlockModel()
+        x = np.random.random((2, 4))
+        model(x)  # build weights
+
+        for i, block in enumerate(model.blocks.values()):
+            for j, layer in enumerate(block):
+                val = float(i * 2 + j + 1)
+                layer.kernel.assign(np.full_like(layer.kernel, val))
+                layer.bias.assign(np.zeros_like(layer.bias))
+
+        ref_out = model(x)
+        temp_filepath = os.path.join(self.get_temp_dir(), "nested_dict.keras")
+        model.save(temp_filepath)
+        new_model = keras.saving.load_model(temp_filepath)
+
+        for i, (orig_block, new_block) in enumerate(
+            zip(model.blocks.values(), new_model.blocks.values())
+        ):
+            for j, (orig_layer, new_layer) in enumerate(
+                zip(orig_block, new_block)
+            ):
+                self.assertAllClose(
+                    orig_layer.kernel,
+                    new_layer.kernel,
+                    msg=f"Kernel mismatch at blocks[{i}][{j}]",
+                )
+
+        out = new_model(x)
+        self.assertAllClose(ref_out, out)
+
     def test_remove_weights_only_saving_and_loading(self):
         def is_remote_path(path):
             return True
