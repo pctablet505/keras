@@ -184,13 +184,6 @@ class LiteRTExporter:
         # output)
         adapted_model = models.Model(inputs=input_layers, outputs=outputs)
 
-        # Preserve the original model's variables
-        adapted_model._variables = self.model.variables
-        adapted_model._trainable_variables = self.model.trainable_variables
-        adapted_model._non_trainable_variables = (
-            self.model.non_trainable_variables
-        )
-
         return adapted_model
 
     def _convert_to_tflite(self, input_signature):
