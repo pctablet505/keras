@@ -6,6 +6,7 @@ from keras.src import backend
 from keras.src import layers
 from keras.src import models
 from keras.src import tree
+from keras.src.export.export_utils import convert_spec_to_tensor
 from keras.src.export.export_utils import get_input_signature
 from keras.src.utils import io_utils
 from keras.src.utils.module_utils import tensorflow as tf
@@ -284,24 +285,22 @@ def export_litert_via_torch(
     """Export Keras model to LiteRT via PyTorch backend."""
     from keras.src.backend.torch.core import device_scope
     from keras.src.backend.torch.core import get_device
-    from keras.src.export.export_utils import convert_spec_to_tensor
 
-    try:
-        import litert_torch
-    except ImportError:
-        raise ImportError(
-            "To export to LiteRT with the PyTorch backend, "
-            "you must install the `litert-torch` package. "
-            "Install via: pip install litert-torch"
-        )
-
-    actual_verbose = verbose if verbose is not None else True
     device = get_device()
 
     # litert_torch internally imports JAX and unconditionally enables
     # jax_enable_x64, which breaks dtype-sensitive tests elsewhere.
     # We preserve the original setting and restore it after conversion.
     with _preserve_jax_x64_state():
+        try:
+            import litert_torch
+        except ImportError:
+            raise ImportError(
+                "To export to LiteRT with the PyTorch backend, "
+                "you must install the `litert-torch` package. "
+                "Install via: pip install litert-torch"
+            )
+
         if device != "cpu":
             for v in model.variables:
                 v.value.data = v.value.data.to("cpu")
@@ -317,14 +316,18 @@ def export_litert_via_torch(
                 )
                 sample_inputs = tuple(sample_inputs)
 
-                if hasattr(model, "eval"):
-                    model.eval()
+                # Although Keras models manage training mode via the
+                # `training` argument to `call()`, `litert_torch.convert`
+                # checks `module.training` and warns when it is `True`.
+                # Calling `eval()` silences that warning and ensures any
+                # PyTorch-native submodules are in inference mode.
+                model.eval()
 
                 litert_torch_kwargs = _prepare_litert_kwargs(
                     kwargs, litert_torch
                 )
 
-                with _silence_output(not actual_verbose):
+                with _silence_output(verbose is False):
                     try:
                         edge_model = litert_torch.convert(
                             model, sample_inputs, **litert_torch_kwargs
@@ -343,7 +346,7 @@ def export_litert_via_torch(
                 for v in model.variables:
                     v.value.data = v.value.data.to(device)
 
-    if actual_verbose:
+    if verbose is not False:
         io_utils.print_msg(f"Saved artifact at '{filepath}'.")
 
     return filepath

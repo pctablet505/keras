@@ -670,8 +670,9 @@ def slice_update(inputs, start_indices, updates):
     # We cannot use Python slice objects because they require scalar int
     # bounds, and extracting scalars from traced tensors creates unbacked
     # symbols that torch.export cannot resolve.
-    # Instead, we build a flat index list via meshgrid and use
-    # index_put_, which is fully traceable.
+    # We also cannot use `torch.narrow` (as the `slice` slow-path does)
+    # because `narrow` is read-only; for in-place updates we need
+    # `index_put_`, which is fully traceable.
     start_indices = convert_to_tensor(start_indices, dtype="int64")
     outputs = inputs.clone()
     update_shape = list(updates.shape)

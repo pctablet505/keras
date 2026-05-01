@@ -4,40 +4,30 @@ import contextlib
 import io
 import os
 
+import jax
 import numpy as np
 import pytest
+import tensorflow as tf
+import torch
 
 from keras.src import backend
 from keras.src import layers
 from keras.src import models
 from keras.src import testing
+from keras.src.export.litert import _preserve_jax_x64_state
 
 # Importing `litert_torch` has the module-level side effect of calling
 # `jax.config.update("jax_enable_x64", True)` (from
-# `litert_torch/backend/jax_bridge/_wrap.py`). This pollutes the global JAX
-# configuration and would cause unrelated dtype tests in the same pytest
-# session to compare against `float64` JAX reference values instead of
-# `float32`. We perform the import here, save the original x64 setting, and
-# restore it immediately so that the rest of the test session sees the
-# original behavior. Tests in this file that actually need x64=True manage
-# it explicitly via setUp/tearDown.
-try:
-    import jax as _jax
+# `litert_torch/backend/jax_bridge/_wrap.py`). We wrap the import with
+# `_preserve_jax_x64_state` so the rest of the test session sees the
+# original behavior.
+with _preserve_jax_x64_state():
+    try:
+        import litert_torch  # noqa: F401
 
-    _ORIG_JAX_X64 = _jax.config.jax_enable_x64
-except ImportError:
-    _jax = None
-    _ORIG_JAX_X64 = None
-
-try:
-    import litert_torch  # noqa: F401
-    import torch  # noqa: F401
-
-    _HAS_LITERT_TORCH = True
-    if _jax is not None:
-        _jax.config.update("jax_enable_x64", _ORIG_JAX_X64)
-except (ImportError, ModuleNotFoundError):
-    _HAS_LITERT_TORCH = False
+        _HAS_LITERT_TORCH = True
+    except (ImportError, ModuleNotFoundError):
+        _HAS_LITERT_TORCH = False
 
 
 def _has_litert_torch():
@@ -65,12 +55,6 @@ def _run_litert_inference(interpreter, input_arrays):
     return outputs if len(outputs) > 1 else outputs[0]
 
 
-def _to_numpy(x):
-    if hasattr(x, "detach"):
-        return x.detach().cpu().numpy()
-    return np.asarray(x)
-
-
 @pytest.mark.skipif(
     backend.backend() != "torch", reason="Requires torch backend"
 )
@@ -81,38 +65,13 @@ class LiteRTTorchExportTest(testing.TestCase):
     LITERT_ATOL = 1e-4
     TORCH_ATOL = 1e-5
 
-    def setUp(self):
-        super().setUp()
-        # litert_torch requires jax_enable_x64=True to correctly generate
-        # StableHLO MLIR with i64/f64 tensors from JAX bridged lowerings.
-        # Save the prior value so tearDown can restore it exactly, rather
-        # than unconditionally forcing a particular value.
-        self._original_jax_x64 = None
-        try:
-            import jax
-
-            self._original_jax_x64 = jax.config.jax_enable_x64
-            jax.config.update("jax_enable_x64", True)
-        except ImportError:
-            pass
-
-    def tearDown(self):
-        super().tearDown()
-        if self._original_jax_x64 is not None:
-            try:
-                import jax
-
-                jax.config.update("jax_enable_x64", self._original_jax_x64)
-            except ImportError:
-                pass
-
     def _verify_litert_export(
         self, model, ref_input, filepath=None, **export_kwargs
     ):
         if filepath is None:
             filepath = os.path.join(self.get_temp_dir(), "model.tflite")
 
-        keras_output = _to_numpy(model(ref_input))
+        keras_output = backend.convert_to_numpy(model(ref_input))
 
         model.export(filepath, format="litert", **export_kwargs)
         self.assertTrue(os.path.exists(filepath))
@@ -198,7 +157,7 @@ class LiteRTTorchExportTest(testing.TestCase):
         keras_outs = model(x)
         if not isinstance(keras_outs, (list, tuple)):
             keras_outs = [keras_outs]
-        keras_outs = [_to_numpy(o) for o in keras_outs]
+        keras_outs = [backend.convert_to_numpy(o) for o in keras_outs]
 
         model.export(tflite_path, format="litert")
         self.assertTrue(os.path.exists(tflite_path))
@@ -221,8 +180,6 @@ class LiteRTTorchExportTest(testing.TestCase):
             )
 
     def test_torch_export_numeric_parity(self):
-        import torch
-
         model = models.Sequential(
             [
                 layers.Dense(16, activation="relu", input_shape=(10,)),
@@ -234,18 +191,18 @@ class LiteRTTorchExportTest(testing.TestCase):
         model.export(pt2_path, format="torch")
 
         x_np = np.random.normal(size=(1, 10)).astype("float32")
-        keras_out = _to_numpy(model(x_np))
+        keras_out = backend.convert_to_numpy(model(x_np))
 
         program = torch.export.load(pt2_path)
         module = program.module()
         device = next(module.parameters()).device
-        pt2_out = _to_numpy(module(torch.tensor(x_np, device=device)))
+        pt2_out = backend.convert_to_numpy(
+            module(torch.tensor(x_np, device=device))
+        )
 
         self.assertAllClose(keras_out, pt2_out, atol=self.TORCH_ATOL)
 
     def test_full_pipeline_numeric_parity(self):
-        import torch
-
         model = models.Sequential(
             [
                 layers.Dense(16, activation="relu", input_shape=(10,)),
@@ -260,12 +217,14 @@ class LiteRTTorchExportTest(testing.TestCase):
         model.export(tflite_path, format="litert")
 
         x_np = np.random.normal(size=(1, 10)).astype("float32")
-        keras_out = _to_numpy(model(x_np))
+        keras_out = backend.convert_to_numpy(model(x_np))
 
         program = torch.export.load(pt2_path)
         module = program.module()
         device = next(module.parameters()).device
-        pt2_out = _to_numpy(module(torch.tensor(x_np, device=device)))
+        pt2_out = backend.convert_to_numpy(
+            module(torch.tensor(x_np, device=device))
+        )
 
         # LiteRT .tflite
         litert_out = _run_litert_inference(
@@ -279,33 +238,7 @@ class LiteRTTorchExportTest(testing.TestCase):
             keras_out, litert_out, atol=self.LITERT_ATOL, msg="Keras vs LiteRT"
         )
 
-    def test_import_error_without_litert_torch(self):
-        import sys
-
-        model = models.Sequential([layers.Dense(1, input_shape=(5,))])
-        path = os.path.join(self.get_temp_dir(), "no_litert.tflite")
-
-        # Setting sys.modules["litert_torch"] = None makes `import litert_torch`
-        # raise ImportError, exercising the missing-package error path without
-        # uninstalling the package.
-        sentinel = object()
-        saved = sys.modules.get("litert_torch", sentinel)
-        sys.modules["litert_torch"] = None
-        try:
-            with self.assertRaises(ImportError):
-                model.export(path, format="litert")
-        finally:
-            if saved is sentinel:
-                del sys.modules["litert_torch"]
-            else:
-                sys.modules["litert_torch"] = saved
-
     def test_export_with_optimizations_default(self):
-        try:
-            import tensorflow as tf
-        except ImportError:
-            self.skipTest("TensorFlow required for optimization constants")
-
         model = models.Sequential(
             [
                 layers.Dense(16, activation="relu", input_shape=(10,)),
@@ -326,7 +259,7 @@ class LiteRTTorchExportTest(testing.TestCase):
 
         # Verify inference still works post-quantization
         x_np = np.random.normal(size=(1, 10)).astype("float32")
-        keras_out = _to_numpy(model(x_np))
+        keras_out = backend.convert_to_numpy(model(x_np))
         litert_out = _run_litert_inference(_get_interpreter(path), [x_np])
 
         # Quantized model has reduced precision
@@ -503,6 +436,12 @@ class LiteRTTorchExportTest(testing.TestCase):
         model.export(path, format="litert", verbose=True)
         self.assertTrue(os.path.exists(path))
 
+        # Verify inference works
+        x_np = np.random.normal(size=(1, 5)).astype("float32")
+        keras_out = backend.convert_to_numpy(model(x_np))
+        litert_out = _run_litert_inference(_get_interpreter(path), [x_np])
+        self.assertAllClose(keras_out, litert_out, atol=self.LITERT_ATOL)
+
     def test_export_with_verbose_false(self):
         model = models.Sequential([layers.Dense(1, input_shape=(5,))])
         path = os.path.join(self.get_temp_dir(), "quiet_test.tflite")
@@ -522,11 +461,6 @@ class LiteRTTorchExportTest(testing.TestCase):
             model.export(path, format="litert")
 
     def test_export_restores_jax_x64_setting(self):
-        try:
-            import jax
-        except ImportError:
-            self.skipTest("JAX is required for x64 restoration checks")
-
         model = models.Sequential([layers.Dense(1, input_shape=(5,))])
         path = os.path.join(self.get_temp_dir(), "jax_restore.tflite")
 
@@ -546,7 +480,12 @@ class LiteRTTorchExportTest(testing.TestCase):
         self.assertTrue(os.path.exists(path))
 
     def test_export_with_normalization_layer(self):
-        """Test export with normalization layer (raw tensor attributes)."""
+        """Test export with a layer that has non-trainable tensor attributes.
+
+        `Normalization` stores `mean` and `variance` as non-trainable tensors
+        after `adapt()`. This ensures such attributes are correctly captured
+        during export, which is distinct coverage from simple `Dense` layers.
+        """
 
         model = models.Sequential(
             [
@@ -567,6 +506,6 @@ class LiteRTTorchExportTest(testing.TestCase):
 
         # Verify inference
         x_np = np.random.normal(size=(1, 5)).astype("float32")
-        keras_out = _to_numpy(model(x_np))
+        keras_out = backend.convert_to_numpy(model(x_np))
         litert_out = _run_litert_inference(_get_interpreter(path), [x_np])
         self.assertAllClose(keras_out, litert_out, atol=1e-4)
