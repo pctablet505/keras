@@ -1204,6 +1204,99 @@ class SavingBattleTest(testing.TestCase):
         out = new_model(x)
         self.assertAllClose(ref_out, out)
 
+    def test_deeply_nested_container_layer_saving(self):
+        """Test 3+ levels of nested containers."""
+
+        @keras.saving.register_keras_serializable(package="test_deeply_nested")
+        class DeeplyNestedModel(keras.Model):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.blocks = [[[keras.layers.Dense(4), keras.layers.Dense(4)]]]
+                self.out_layer = keras.layers.Dense(2)
+
+            def call(self, x):
+                for block_list in self.blocks:
+                    for block in block_list:
+                        for layer in block:
+                            x = layer(x)
+                return self.out_layer(x)
+
+            def get_config(self):
+                return super().get_config()
+
+        model = DeeplyNestedModel()
+        x = np.random.random((2, 4))
+        model(x)
+        ref_out = model(x)
+
+        temp_filepath = os.path.join(self.get_temp_dir(), "deeply_nested.keras")
+        model.save(temp_filepath)
+        new_model = keras.saving.load_model(temp_filepath)
+        out = new_model(x)
+        self.assertAllClose(ref_out, out)
+
+    def test_mixed_nested_container_layer_saving(self):
+        """Test mixed container types (list + tuple)."""
+
+        @keras.saving.register_keras_serializable(package="test_mixed_nested")
+        class MixedNestedModel(keras.Model):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.blocks = [(keras.layers.Dense(4), keras.layers.Dense(4))]
+                self.out_layer = keras.layers.Dense(2)
+
+            def call(self, x):
+                for block in self.blocks:
+                    for layer in block:
+                        x = layer(x)
+                return self.out_layer(x)
+
+            def get_config(self):
+                return super().get_config()
+
+        model = MixedNestedModel()
+        x = np.random.random((2, 4))
+        model(x)
+        ref_out = model(x)
+
+        temp_filepath = os.path.join(self.get_temp_dir(), "mixed_nested.keras")
+        model.save(temp_filepath)
+        new_model = keras.saving.load_model(temp_filepath)
+        out = new_model(x)
+        self.assertAllClose(ref_out, out)
+
+    def test_cyclic_container_saving(self):
+        """Test that cyclic container references do not cause RecursionError."""
+
+        @keras.saving.register_keras_serializable(
+            package="test_cyclic_container"
+        )
+        class CyclicContainerModel(keras.Model):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.blocks = []
+                self.blocks.append(self.blocks)
+                self.out = keras.layers.Dense(2)
+
+            def call(self, x):
+                return self.out(x)
+
+            def get_config(self):
+                return super().get_config()
+
+        model = CyclicContainerModel()
+        x = np.random.random((2, 4))
+        model(x)
+        ref_out = model(x)
+
+        temp_filepath = os.path.join(
+            self.get_temp_dir(), "cyclic_container.keras"
+        )
+        model.save(temp_filepath)
+        new_model = keras.saving.load_model(temp_filepath)
+        out = new_model(x)
+        self.assertAllClose(ref_out, out)
+
     def test_remove_weights_only_saving_and_loading(self):
         def is_remote_path(path):
             return True

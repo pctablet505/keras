@@ -875,9 +875,20 @@ def _get_unique_name(name, used_names):
 
 
 def _save_container_state(
-    container, weights_store, assets_store, inner_path, visited_saveables
+    container,
+    weights_store,
+    assets_store,
+    inner_path,
+    visited_saveables,
+    visited_containers=None,
 ):
     from keras.src.saving.keras_saveable import KerasSaveable
+
+    if visited_containers is None:
+        visited_containers = set()
+    if id(container) in visited_containers:
+        return
+    visited_containers.add(id(container))
 
     used_names = {}
     if isinstance(container, dict):
@@ -907,6 +918,7 @@ def _save_container_state(
                 assets_store,
                 inner_path=file_utils.join(inner_path, name).replace("\\", "/"),
                 visited_saveables=visited_saveables,
+                visited_containers=visited_containers,
             )
 
 
@@ -919,8 +931,15 @@ def _load_container_state(
     visited_saveables,
     failed_saveables,
     error_msgs,
+    visited_containers=None,
 ):
     from keras.src.saving.keras_saveable import KerasSaveable
+
+    if visited_containers is None:
+        visited_containers = set()
+    if id(container) in visited_containers:
+        return
+    visited_containers.add(id(container))
 
     used_names = {}
     if isinstance(container, dict):
@@ -953,6 +972,7 @@ def _load_container_state(
                 visited_saveables=visited_saveables,
                 failed_saveables=failed_saveables,
                 error_msgs=error_msgs,
+                visited_containers=visited_containers,
             )
 
 
