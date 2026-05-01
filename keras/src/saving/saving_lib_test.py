@@ -1132,21 +1132,35 @@ class SavingBattleTest(testing.TestCase):
         out = new_model(x)
         self.assertAllClose(out, ref_out)
 
-    def test_nested_list_layer_saving(self):
-        """Test that layers stored in nested lists are saved/loaded."""
+    @parameterized.named_parameters(
+        ("list", list, lambda b: b),
+        ("tuple", tuple, lambda b: b),
+        ("dict", dict, lambda b: b.values()),
+    )
+    def test_nested_container_layer_saving(self, container_type, get_values):
+        """Test that layers stored in nested containers are saved/loaded."""
 
-        @keras.saving.register_keras_serializable(package="test_nested_list")
-        class NestedListBlockModel(keras.Model):
+        package = f"test_nested_{container_type.__name__}"
+
+        @keras.saving.register_keras_serializable(package=package)
+        class NestedContainerModel(keras.Model):
             def __init__(self, **kwargs):
                 super().__init__(**kwargs)
-                self.blocks = [
-                    [keras.layers.Dense(8), keras.layers.Dense(8)],
-                    [keras.layers.Dense(8), keras.layers.Dense(8)],
-                ]
+                inner1 = [keras.layers.Dense(8), keras.layers.Dense(8)]
+                inner2 = [keras.layers.Dense(8), keras.layers.Dense(8)]
+                if container_type is dict:
+                    self.blocks = {
+                        "block_a": inner1,
+                        "block_b": inner2,
+                    }
+                elif container_type is list:
+                    self.blocks = [inner1, inner2]
+                else:
+                    self.blocks = (tuple(inner1), tuple(inner2))
                 self.out_layer = keras.layers.Dense(2)
 
             def call(self, x):
-                for block in self.blocks:
+                for block in get_values(self.blocks):
                     for layer in block:
                         x = layer(x)
                 return self.out_layer(x)
@@ -1154,136 +1168,29 @@ class SavingBattleTest(testing.TestCase):
             def get_config(self):
                 return super().get_config()
 
-        model = NestedListBlockModel()
+        model = NestedContainerModel()
         x = np.random.random((2, 4))
         model(x)  # build weights
 
         # Assign distinct constant kernels so that any layer-swapping
         # on reload would produce a detectable mismatch.
-        for i, block in enumerate(model.blocks):
+        for i, block in enumerate(get_values(model.blocks)):
             for j, layer in enumerate(block):
                 val = float(i * 2 + j + 1)  # 1.0, 2.0, 3.0, 4.0
                 layer.kernel.assign(np.full_like(layer.kernel, val))
                 layer.bias.assign(np.zeros_like(layer.bias))
 
         ref_out = model(x)
-        temp_filepath = os.path.join(self.get_temp_dir(), "nested_list.keras")
+        suffix = container_type.__name__
+        temp_filepath = os.path.join(
+            self.get_temp_dir(), f"nested_{suffix}.keras"
+        )
         model.save(temp_filepath)
         new_model = keras.saving.load_model(temp_filepath)
 
         # Verify each nested layer's weights were individually restored.
         for i, (orig_block, new_block) in enumerate(
-            zip(model.blocks, new_model.blocks)
-        ):
-            for j, (orig_layer, new_layer) in enumerate(
-                zip(orig_block, new_block)
-            ):
-                self.assertAllClose(
-                    orig_layer.kernel,
-                    new_layer.kernel,
-                    msg=f"Kernel mismatch at blocks[{i}][{j}]",
-                )
-
-        out = new_model(x)
-        self.assertAllClose(ref_out, out)
-
-    def test_nested_tuple_layer_saving(self):
-        """Test that layers stored in nested tuples are saved/loaded."""
-
-        @keras.saving.register_keras_serializable(package="test_nested_tuple")
-        class NestedTupleBlockModel(keras.Model):
-            def __init__(self, **kwargs):
-                super().__init__(**kwargs)
-                self.blocks = (
-                    (keras.layers.Dense(8), keras.layers.Dense(8)),
-                    (keras.layers.Dense(8), keras.layers.Dense(8)),
-                )
-                self.out_layer = keras.layers.Dense(2)
-
-            def call(self, x):
-                for block in self.blocks:
-                    for layer in block:
-                        x = layer(x)
-                return self.out_layer(x)
-
-            def get_config(self):
-                return super().get_config()
-
-        model = NestedTupleBlockModel()
-        x = np.random.random((2, 4))
-        model(x)  # build weights
-
-        for i, block in enumerate(model.blocks):
-            for j, layer in enumerate(block):
-                val = float(i * 2 + j + 1)
-                layer.kernel.assign(np.full_like(layer.kernel, val))
-                layer.bias.assign(np.zeros_like(layer.bias))
-
-        ref_out = model(x)
-        temp_filepath = os.path.join(self.get_temp_dir(), "nested_tuple.keras")
-        model.save(temp_filepath)
-        new_model = keras.saving.load_model(temp_filepath)
-
-        for i, (orig_block, new_block) in enumerate(
-            zip(model.blocks, new_model.blocks)
-        ):
-            for j, (orig_layer, new_layer) in enumerate(
-                zip(orig_block, new_block)
-            ):
-                self.assertAllClose(
-                    orig_layer.kernel,
-                    new_layer.kernel,
-                    msg=f"Kernel mismatch at blocks[{i}][{j}]",
-                )
-
-        out = new_model(x)
-        self.assertAllClose(ref_out, out)
-
-    def test_nested_dict_layer_saving(self):
-        """Test that layers stored in nested dicts are saved/loaded."""
-
-        @keras.saving.register_keras_serializable(package="test_nested_dict")
-        class NestedDictBlockModel(keras.Model):
-            def __init__(self, **kwargs):
-                super().__init__(**kwargs)
-                self.blocks = {
-                    "block_a": [
-                        keras.layers.Dense(8),
-                        keras.layers.Dense(8),
-                    ],
-                    "block_b": [
-                        keras.layers.Dense(8),
-                        keras.layers.Dense(8),
-                    ],
-                }
-                self.out_layer = keras.layers.Dense(2)
-
-            def call(self, x):
-                for block in self.blocks.values():
-                    for layer in block:
-                        x = layer(x)
-                return self.out_layer(x)
-
-            def get_config(self):
-                return super().get_config()
-
-        model = NestedDictBlockModel()
-        x = np.random.random((2, 4))
-        model(x)  # build weights
-
-        for i, block in enumerate(model.blocks.values()):
-            for j, layer in enumerate(block):
-                val = float(i * 2 + j + 1)
-                layer.kernel.assign(np.full_like(layer.kernel, val))
-                layer.bias.assign(np.zeros_like(layer.bias))
-
-        ref_out = model(x)
-        temp_filepath = os.path.join(self.get_temp_dir(), "nested_dict.keras")
-        model.save(temp_filepath)
-        new_model = keras.saving.load_model(temp_filepath)
-
-        for i, (orig_block, new_block) in enumerate(
-            zip(model.blocks.values(), new_model.blocks.values())
+            zip(get_values(model.blocks), get_values(new_model.blocks))
         ):
             for j, (orig_layer, new_layer) in enumerate(
                 zip(orig_block, new_block)

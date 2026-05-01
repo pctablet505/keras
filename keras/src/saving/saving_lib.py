@@ -900,7 +900,7 @@ def _save_container_state(
                 visited_saveables=visited_saveables,
             )
         elif isinstance(saveable, (list, dict, tuple)):
-            name = _get_unique_name("_container", used_names)
+            name = _get_unique_name("container", used_names)
             _save_container_state(
                 saveable,
                 weights_store,
@@ -943,7 +943,7 @@ def _load_container_state(
                 error_msgs=error_msgs,
             )
         elif isinstance(saveable, (list, dict, tuple)):
-            name = _get_unique_name("_container", used_names)
+            name = _get_unique_name("container", used_names)
             _load_container_state(
                 saveable,
                 weights_store,
