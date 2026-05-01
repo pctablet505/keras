@@ -228,9 +228,9 @@ class TensorBoard(Callback):
     @property
     def summary(self):
         if self._summary_module is None:
-            from keras.src.utils.module_utils import tensorflow as tf
+            import tensorflow.summary as summary
 
-            self._summary_module = tf.summary
+            self._summary_module = summary
         return self._summary_module
 
     @property
@@ -319,14 +319,13 @@ class TensorBoard(Callback):
 
         def should_record():
             result = step % self.update_freq == 0
-            # Convert tensor to Python bool for TF record_if compatibility
-            # across all backends (torch GPU tensors cannot be directly
-            # converted to numpy without a CPU transfer).
+            # Convert tensor to Python bool for TF record_if compatibility.
+            # PyTorch GPU tensors support .item() natively; TF eager tensors
+            # use .numpy(); TF graph mode tensors fall through unchanged.
+            if hasattr(result, "item"):
+                return bool(result.item())
             if hasattr(result, "numpy"):
-                if hasattr(result, "cpu"):
-                    result = bool(result.cpu().numpy())
-                else:
-                    result = bool(result.numpy())
+                return bool(result.numpy())
             return result
 
         summary_context = (
@@ -688,11 +687,8 @@ def keras_model_summary(name, data, step=None):
         ValueError: if a default writer exists, but no step was provided and
             `tf.summary.experimental.get_step()` is `None`.
     """
+    import tensorflow.summary as summary
     from tensorflow.compat.v1 import SummaryMetadata
-
-    from keras.src.utils.module_utils import tensorflow as tf
-
-    summary = tf.summary
 
     summary_metadata = SummaryMetadata()
     # Hard coding a plugin name. Please refer to go/tb-plugin-name-hardcode for
