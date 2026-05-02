@@ -222,11 +222,15 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
             )
 
     # Convert to np in case of any array-like that is not list or tuple.
-    if not isinstance(x, (list, tuple)):
+    # Skip scalar Python values to avoid np.array(float) -> float64, which
+    # causes dtype issues during torch.export (constants are lifted before
+    # the cast to the requested dtype).
+    if isinstance(x, (list, tuple)):
+        if len(x) > 0 and any(isinstance(x1, torch.Tensor) for x1 in x):
+            # Handle list or tuple of torch tensors
+            return torch.stack([convert_to_tensor(x1) for x1 in x])
+    elif not isinstance(x, (bool, int, float)):
         x = np.array(x)
-    elif len(x) > 0 and any(isinstance(x1, torch.Tensor) for x1 in x):
-        # Handle list or tuple of torch tensors
-        return torch.stack([convert_to_tensor(x1) for x1 in x])
     if isinstance(x, np.ndarray):
         if x.dtype == np.uint32:
             # Torch backend does not support uint32.
