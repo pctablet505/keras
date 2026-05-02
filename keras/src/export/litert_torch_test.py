@@ -341,11 +341,6 @@ class LiteRTTorchExportTest(testing.TestCase):
     def test_export_with_multiple_kwargs(self):
         """Test export with multiple litert_torch kwargs."""
 
-        try:
-            import tensorflow as tf
-        except ImportError:
-            self.skipTest("TensorFlow required for optimizations kwarg")
-
         model = models.Sequential(
             [
                 layers.Dense(8, activation="relu", input_shape=(10,)),
@@ -401,9 +396,6 @@ class LiteRTTorchExportTest(testing.TestCase):
                 allow_custom_ops=True,
             )
 
-    # ------------------------------------------------------------------ #
-    #  Edge cases and robustness tests
-    # ------------------------------------------------------------------ #
     def test_export_preserves_model_device(self):
         """Verify model tensors return to original device after export."""
 

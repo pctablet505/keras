@@ -439,8 +439,6 @@ def _create_quant_config_from_optimizations(optimizations, litert_torch):
         return None
 
     try:
-        import tensorflow as tf
-
         optimize_default = tf.lite.Optimize.DEFAULT
         optimize_size = getattr(tf.lite.Optimize, "OPTIMIZE_FOR_SIZE", None)
         optimize_latency = getattr(
