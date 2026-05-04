@@ -1,3 +1,4 @@
+import math
 import warnings
 
 from keras.src import backend
@@ -99,6 +100,18 @@ def export_onnx(
         )
         decorated_fn = get_concrete_fn(model, input_signature, **kwargs)
 
+        # Estimate total weight size to decide if large_model format is needed.
+        # TensorFlow GraphDef has a 2GB protobuf limit; tf2onnx's large_model
+        # path stores weights externally to avoid this.
+        total_bytes = 0
+        for w in model.weights:
+            shape = w.shape
+            if shape is None or None in shape:
+                continue
+            total_bytes += math.prod(shape) * w.value.dtype.size
+
+        large_model = total_bytes > (3 * 1024**3 // 2)
+
         # Use `tf2onnx` to convert the `decorated_fn` to the ONNX format.
         patch_tf2onnx()  # TODO: Remove this once `tf2onnx` supports numpy 2.
         tf2onnx.convert.from_function(
@@ -106,6 +119,7 @@ def export_onnx(
             input_signature,
             opset=opset_version,
             output_path=filepath,
+            large_model=large_model,
         )
 
     elif backend.backend() == "jax":
