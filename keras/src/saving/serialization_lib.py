@@ -733,6 +733,13 @@ def deserialize_keras_object(
     custom_obj_scope = object_registration.CustomObjectScope(custom_objects)
     safe_mode_scope = SafeModeScope(safe_mode)
     _validate_config(inner_config)
+    build_config = config.get("build_config", None)
+    if build_config:
+        _validate_config(build_config, path="build_config")
+    compile_config = config.get("compile_config", None)
+    if compile_config:
+        _validate_config(compile_config, path="compile_config")
+
     with custom_obj_scope, safe_mode_scope:
         try:
             instance = cls.from_config(inner_config)
@@ -745,11 +752,9 @@ def deserialize_keras_object(
                 " model's `from_config()` method."
                 f"\n\nconfig={config}.\n\nException encountered: {e}"
             )
-        build_config = config.get("build_config", None)
         if build_config and not instance.built:
             instance.build_from_config(build_config)
             instance.built = True
-        compile_config = config.get("compile_config", None)
         if compile_config:
             instance.compile_from_config(compile_config)
             instance.compiled = True
