@@ -156,6 +156,10 @@ def _get_interpreter_outputs(interpreter):
     backend.backend() != "tensorflow",
     reason="`export_litert` currently supports the TensorFlow backend only.",
 )
+@pytest.mark.skipif(
+    LiteRTInterpreter is None,
+    reason="`ai_edge_litert` is not available.",
+)
 class ExportLitertTest(testing.TestCase):
     """Test suite for LiteRT (TFLite) model export functionality.
 
@@ -410,8 +414,6 @@ class ExportLitertTest(testing.TestCase):
 
     def test_export_subclass_model(self):
         """Test exporting subclass models (uses wrapper conversion path)."""
-        if LiteRTInterpreter is None:
-            self.skipTest("No LiteRT interpreter available")
 
         model = get_model("subclass")
         temp_filepath = os.path.join(
@@ -437,8 +439,6 @@ class ExportLitertTest(testing.TestCase):
 
     def test_export_with_optimizations_default(self):
         """Test export with DEFAULT optimization."""
-        if LiteRTInterpreter is None:
-            self.skipTest("No LiteRT interpreter available")
 
         model = get_model("sequential")
         temp_filepath = os.path.join(
@@ -469,8 +469,6 @@ class ExportLitertTest(testing.TestCase):
 
     def test_export_with_optimizations_sparsity(self):
         """Test export with EXPERIMENTAL_SPARSITY optimization."""
-        if LiteRTInterpreter is None:
-            self.skipTest("No LiteRT interpreter available")
 
         model = get_model("functional")
         temp_filepath = os.path.join(
@@ -500,8 +498,6 @@ class ExportLitertTest(testing.TestCase):
 
     def test_export_with_optimizations_size(self):
         """Test export with OPTIMIZE_FOR_SIZE optimization."""
-        if LiteRTInterpreter is None:
-            self.skipTest("No LiteRT interpreter available")
 
         model = get_model("sequential")
         temp_filepath = os.path.join(
@@ -530,8 +526,6 @@ class ExportLitertTest(testing.TestCase):
 
     def test_export_with_optimizations_latency(self):
         """Test export with OPTIMIZE_FOR_LATENCY optimization."""
-        if LiteRTInterpreter is None:
-            self.skipTest("No LiteRT interpreter available")
 
         model = get_model("functional")
         temp_filepath = os.path.join(
@@ -560,8 +554,6 @@ class ExportLitertTest(testing.TestCase):
 
     def test_export_with_multiple_optimizations(self):
         """Test export with multiple optimization options combined."""
-        if LiteRTInterpreter is None:
-            self.skipTest("No LiteRT interpreter available")
 
         model = get_model("sequential")
         temp_filepath = os.path.join(
@@ -593,8 +585,6 @@ class ExportLitertTest(testing.TestCase):
 
     def test_export_with_representative_dataset(self):
         """Test export with representative dataset for better quantization."""
-        if LiteRTInterpreter is None:
-            self.skipTest("No LiteRT interpreter available")
 
         model = get_model("functional")
         temp_filepath = os.path.join(
@@ -630,8 +620,6 @@ class ExportLitertTest(testing.TestCase):
 
     def test_export_with_multiple_kwargs(self):
         """Test export with multiple converter kwargs."""
-        if LiteRTInterpreter is None:
-            self.skipTest("No LiteRT interpreter available")
 
         # Create a larger model for quantization testing
         inputs = layers.Input(shape=(28, 28, 3))
@@ -666,8 +654,6 @@ class ExportLitertTest(testing.TestCase):
 
     def test_export_optimization_file_size_comparison(self):
         """Test that optimizations reduce file size."""
-        if LiteRTInterpreter is None:
-            self.skipTest("No LiteRT interpreter available")
 
         # Create a larger model to see size differences
         inputs = layers.Input(shape=(28, 28, 3))
@@ -716,8 +702,6 @@ class ExportLitertTest(testing.TestCase):
 
     def test_signature_def_with_named_model(self):
         """Test that exported models have SignatureDef with input names."""
-        if LiteRTInterpreter is None:
-            self.skipTest("No LiteRT interpreter available")
 
         # Build a model with explicit layer names
         inputs = layers.Input(shape=(10,), name="feature_input")
@@ -796,8 +780,6 @@ class ExportLitertTest(testing.TestCase):
     def test_signature_def_with_functional_model(self):
         """Test that SignatureDef preserves input/output names for
         Functional models."""
-        if LiteRTInterpreter is None:
-            self.skipTest("No LiteRT interpreter available")
 
         # Create a Functional model with named inputs and outputs
         inputs = layers.Input(shape=(10,), name="input_layer")
@@ -871,8 +853,6 @@ class ExportLitertTest(testing.TestCase):
 
     def test_signature_def_with_multi_input_model(self):
         """Test that SignatureDef preserves names for multi-input models."""
-        if LiteRTInterpreter is None:
-            self.skipTest("No LiteRT interpreter available")
 
         # Create a multi-input model
         input1 = layers.Input(shape=(10,), name="input_1")
@@ -955,8 +935,6 @@ class ExportLitertTest(testing.TestCase):
 
     def test_signature_def_with_multi_output_model(self):
         """Test that SignatureDef handles multi-output models correctly."""
-        if LiteRTInterpreter is None:
-            self.skipTest("No LiteRT interpreter available")
 
         # Create a multi-output model
         inputs = layers.Input(shape=(10,), name="input_layer")
