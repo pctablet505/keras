@@ -156,11 +156,45 @@ def _get_interpreter_outputs(interpreter):
     backend.backend() != "tensorflow",
     reason="`export_litert` currently supports the TensorFlow backend only.",
 )
+class ExportLitertBasicTest(testing.TestCase):
+    """Basic tests for LiteRT export that don't require the interpreter."""
+
+    def test_export_error_handling(self):
+        """Test error handling in export API."""
+        model = get_model("sequential")
+        dummy_input = np.random.random((3, 10)).astype(np.float32)
+        model(dummy_input)
+
+        temp_filepath = os.path.join(
+            self.get_temp_dir(), "exported_model.tflite"
+        )
+
+        # Test with invalid format
+        with self.assertRaises(ValueError):
+            model.export(temp_filepath, format="invalid_format")
+
+    def test_export_invalid_filepath(self):
+        """Test that export fails with invalid file extension."""
+        model = get_model("sequential")
+        dummy_input = np.random.random((3, 10)).astype(np.float32)
+        model(dummy_input)
+
+        temp_filepath = os.path.join(self.get_temp_dir(), "exported_model.txt")
+
+        # Should raise ValueError for wrong extension
+        with self.assertRaises(ValueError):
+            model.export(temp_filepath, format="litert")
+
+
+@pytest.mark.skipif(
+    backend.backend() != "tensorflow",
+    reason="`export_litert` currently supports the TensorFlow backend only.",
+)
 @pytest.mark.skipif(
     LiteRTInterpreter is None,
     reason="`ai_edge_litert` is not available.",
 )
-class ExportLitertTest(testing.TestCase):
+class ExportLitertInterpreterTest(testing.TestCase):
     """Test suite for LiteRT (TFLite) model export functionality.
 
     Tests use AI Edge LiteRT interpreter for validation.
@@ -385,32 +419,6 @@ class ExportLitertTest(testing.TestCase):
 
         input_details = interpreter.get_input_details()
         self.assertEqual(len(input_details), 1)
-
-    def test_export_error_handling(self):
-        """Test error handling in export API."""
-        model = get_model("sequential")
-        dummy_input = np.random.random((3, 10)).astype(np.float32)
-        model(dummy_input)
-
-        temp_filepath = os.path.join(
-            self.get_temp_dir(), "exported_model.tflite"
-        )
-
-        # Test with invalid format
-        with self.assertRaises(ValueError):
-            model.export(temp_filepath, format="invalid_format")
-
-    def test_export_invalid_filepath(self):
-        """Test that export fails with invalid file extension."""
-        model = get_model("sequential")
-        dummy_input = np.random.random((3, 10)).astype(np.float32)
-        model(dummy_input)
-
-        temp_filepath = os.path.join(self.get_temp_dir(), "exported_model.txt")
-
-        # Should raise ValueError for wrong extension
-        with self.assertRaises(ValueError):
-            model.export(temp_filepath, format="litert")
 
     def test_export_subclass_model(self):
         """Test exporting subclass models (uses wrapper conversion path)."""
