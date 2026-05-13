@@ -12,6 +12,7 @@ from keras.src import testing
 from keras.src import tree
 from keras.src.saving import saving_lib
 from keras.src.testing.test_utils import named_product
+from keras.src.export.export_utils import get_input_signature
 from keras.src.utils.module_utils import tensorflow
 
 # LiteRT tests require the AI Edge LiteRT interpreter.
@@ -1251,6 +1252,55 @@ class ExportLitertInterpreterTest(testing.TestCase):
         litert_output = _get_interpreter_outputs(interpreter)
 
         self.assertAllClose(litert_output, ref_output, atol=1e-4, rtol=1e-4)
+
+    def test_subclass_model_input_signature_reflects_recent_call(self):
+        """Subclassed models should export with most recent call shapes.
+
+        Regression test for stale `_build_shapes_dict`: when a subclassed model
+        is first built at one shape (e.g. `[1, 1]`) and later called at a
+        different shape (e.g. `[1, 32]`), `get_input_signature` must return
+        the latest shape so that LiteRT export traces the correct graph.
+        """
+
+        class TinyLM(models.Model):
+            def __init__(self, vocab_size=100, hidden_dim=16):
+                super().__init__()
+                self.embed = layers.Embedding(vocab_size, hidden_dim)
+                self.dense = layers.Dense(vocab_size)
+
+            def call(self, inputs):
+                x = self.embed(inputs["token_ids"])
+                return self.dense(x)
+
+        model = TinyLM()
+        # First call builds the model at shape [1, 1]
+        model({"token_ids": ops.zeros((1, 1), dtype="int32")})
+        sig_after_build = get_input_signature(model)
+        self.assertEqual(sig_after_build[0]["token_ids"].shape, (None, 1))
+
+        # Second call at shape [1, 32] — get_input_signature must update
+        model({"token_ids": ops.zeros((1, 32), dtype="int32")})
+        sig_after_call = get_input_signature(model)
+        self.assertEqual(
+            sig_after_call[0]["token_ids"].shape,
+            (None, 32),
+            "get_input_signature should reflect the most recent call shape",
+        )
+
+        # Export should use the updated signature and produce correct shapes
+        temp_filepath = os.path.join(
+            self.get_temp_dir(), "subclass_recent_shape.tflite"
+        )
+        model.export(temp_filepath, format="litert")
+        self.assertTrue(os.path.exists(temp_filepath))
+
+        interpreter = LiteRTInterpreter(model_path=temp_filepath)
+        interpreter.allocate_tensors()
+
+        input_details = interpreter.get_input_details()
+        self.assertEqual(len(input_details), 1)
+        # The single input should have shape [1, 32] (batch is dynamic None)
+        self.assertEqual(tuple(input_details[0]["shape"]), (1, 32))
 
     def test_dict_input_multi_output_model(self):
         """Test dict input model with multiple outputs exports successfully."""

@@ -1540,6 +1540,17 @@ class Layer(BackendLayer, Operation):
 
     def _maybe_build(self, call_spec):
         if self.built:
+            # For models without a custom build(), update _build_shapes_dict
+            # so that export tools (get_input_signature, saved-model serving,
+            # etc.) use the most recent call shapes rather than the stale
+            # shapes from the initial build.  Regular layers and models with
+            # custom build() keep the original build shapes to preserve
+            # build_from_config semantics.
+            from keras.src.models.model import Model
+
+            if isinstance(self, Model) and utils.is_default(self.build):
+                shapes_dict = get_shapes_dict(call_spec)
+                self._build_shapes_dict = shapes_dict
             return
 
         shapes_dict = get_shapes_dict(call_spec)
