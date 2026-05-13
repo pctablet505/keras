@@ -229,8 +229,7 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
             # Handle list or tuple of torch tensors
             return torch.stack([convert_to_tensor(x1) for x1 in x])
         if len(x) > 0 and any(
-            isinstance(x1, (torch.SymInt, torch.SymFloat))
-            for x1 in x
+            isinstance(x1, (torch.SymInt, torch.SymFloat)) for x1 in x
         ):
             # Symbolic shape values from torch.export can't go through numpy
             # and don't have a .dtype attribute. Use torch.as_tensor directly.
@@ -642,8 +641,7 @@ def slice(inputs, start_indices, shape):
             isinstance(s, (int, torch.SymInt, torch.SymFloat))
             for s in start_indices
         ) and all(
-            isinstance(s, (int, torch.SymInt, torch.SymFloat))
-            for s in shape
+            isinstance(s, (int, torch.SymInt, torch.SymFloat)) for s in shape
         ):
             slices = [
                 builtins.slice(start_index, start_index + length)

@@ -40,8 +40,10 @@ def get_input_signature(model):
         # backend LiteRT) trace with representative dimensions rather
         # than all-None shapes that collapse to (1, 1) sample tensors.
         shapes_dict = getattr(model, "_build_shapes_dict", None)
-        if shapes_dict and input_signature and isinstance(
-            input_signature[0], dict
+        if (
+            shapes_dict
+            and input_signature
+            and isinstance(input_signature[0], dict)
         ):
             actual_shapes = None
             for value in shapes_dict.values():
@@ -51,6 +53,7 @@ def get_input_signature(model):
                     actual_shapes = value
                     break
             if actual_shapes is not None:
+
                 def _update_spec(spec, shape):
                     if isinstance(spec, layers.InputSpec):
                         new_shape = (None,) + tuple(shape)[1:]

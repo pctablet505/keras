@@ -10,9 +10,9 @@ from keras.src import models
 from keras.src import ops
 from keras.src import testing
 from keras.src import tree
+from keras.src.export.export_utils import get_input_signature
 from keras.src.saving import saving_lib
 from keras.src.testing.test_utils import named_product
-from keras.src.export.export_utils import get_input_signature
 from keras.src.utils.module_utils import tensorflow
 
 # LiteRT tests require the AI Edge LiteRT interpreter.
@@ -1391,13 +1391,19 @@ class ExportLitertInterpreterTest(testing.TestCase):
 
         # Three calls at increasing lengths
         model({"token_ids": ops.zeros((1, 1), dtype="int32")})
-        self.assertEqual(get_input_signature(model)[0]["token_ids"].shape, (None, 1))
+        self.assertEqual(
+            get_input_signature(model)[0]["token_ids"].shape, (None, 1)
+        )
 
         model({"token_ids": ops.zeros((1, 32), dtype="int32")})
-        self.assertEqual(get_input_signature(model)[0]["token_ids"].shape, (None, 32))
+        self.assertEqual(
+            get_input_signature(model)[0]["token_ids"].shape, (None, 32)
+        )
 
         model({"token_ids": ops.zeros((1, 64), dtype="int32")})
-        self.assertEqual(get_input_signature(model)[0]["token_ids"].shape, (None, 64))
+        self.assertEqual(
+            get_input_signature(model)[0]["token_ids"].shape, (None, 64)
+        )
 
         # Final export must use the most recent shape [1, 64]
         temp_filepath = os.path.join(
