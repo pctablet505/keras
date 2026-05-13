@@ -10,16 +10,10 @@ def register_tree_node_class(cls):
 
 # Register backend-specific node classes
 if backend() == "tensorflow":
-    try:
-        from tensorflow.python.trackable.data_structures import ListWrapper
-        from tensorflow.python.trackable.data_structures import _DictWrapper
-    except (ImportError, ModuleNotFoundError):
-        ListWrapper = None
-        _DictWrapper = None
+    from tensorflow.python.trackable.data_structures import ListWrapper
+    from tensorflow.python.trackable.data_structures import _DictWrapper
 
     try:
-        if ListWrapper is None or _DictWrapper is None:
-            raise ImportError("TF trackable not available")
         optree.register_pytree_node(
             ListWrapper,
             lambda x: (x, None),
