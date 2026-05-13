@@ -228,6 +228,14 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
         if len(x) > 0 and any(isinstance(x1, torch.Tensor) for x1 in x):
             # Handle list or tuple of torch tensors
             return torch.stack([convert_to_tensor(x1) for x1 in x])
+        if len(x) > 0 and any(
+            isinstance(x1, (torch.SymInt, torch.SymFloat))
+            for x1 in x
+        ):
+            # Symbolic shape values from torch.export can't go through numpy
+            # and don't have a .dtype attribute. Use torch.as_tensor directly.
+            dt = to_torch_dtype(dtype) if dtype is not None else torch.int64
+            return torch.as_tensor(x, dtype=dt, device=get_device())
     elif not isinstance(x, (bool, int, float)):
         x = np.array(x)
     if isinstance(x, np.ndarray):
@@ -630,8 +638,12 @@ def slice(inputs, start_indices, shape):
     if isinstance(start_indices, (list, tuple)) and isinstance(
         shape, (list, tuple)
     ):
-        if all(isinstance(s, int) for s in start_indices) and all(
-            isinstance(s, int) for s in shape
+        if all(
+            isinstance(s, (int, torch.SymInt, torch.SymFloat))
+            for s in start_indices
+        ) and all(
+            isinstance(s, (int, torch.SymInt, torch.SymFloat))
+            for s in shape
         ):
             slices = [
                 builtins.slice(start_index, start_index + length)
