@@ -37,9 +37,6 @@ def export_litert(
             f"'.tflite'. Got: {filepath}"
         )
 
-    if input_signature is None:
-        input_signature = get_input_signature(model)
-
     if backend.backend() == "torch":
         return export_litert_via_torch(
             model,

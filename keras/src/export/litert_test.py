@@ -1302,6 +1302,116 @@ class ExportLitertInterpreterTest(testing.TestCase):
         # The single input should have shape [1, 32] (batch is dynamic None)
         self.assertEqual(tuple(input_details[0]["shape"]), (1, 32))
 
+    def test_subclass_model_with_custom_build_preserves_original_shape(self):
+        """Models with custom build() must not update _build_shapes_dict.
+
+        The _maybe_build fix is gated by `utils.is_default(self.build)`.
+        Models that override build() rely on _build_shapes_dict for
+        build_from_config semantics; updating it would break weight
+        recreation on deserialization.
+        """
+
+        class CustomBuildModel(models.Model):
+            def __init__(self):
+                super().__init__()
+                self.dense = layers.Dense(8)
+
+            def build(self, input_shape):
+                self.dense.build(input_shape)
+                self.built = True
+
+            def call(self, x):
+                return self.dense(x)
+
+        model = CustomBuildModel()
+        model.build((None, 10))  # explicit build at feature dim 10
+        original_shapes = dict(model._build_shapes_dict)
+
+        # Subsequent call with different batch but same feature dim
+        model(ops.zeros((2, 10), dtype="float32"))
+
+        # _build_shapes_dict must stay at the original build shape
+        self.assertEqual(
+            model._build_shapes_dict,
+            original_shapes,
+            "Custom build() models must preserve original _build_shapes_dict",
+        )
+
+        sig = get_input_signature(model)
+        self.assertEqual(sig[0].shape, (None, 10))
+
+    def test_functional_model_input_signature_ignores_build_shapes_dict(self):
+        """Functional models use _inputs_struct, not _build_shapes_dict.
+
+        Calling a Functional model at different shapes must not affect
+        get_input_signature, which derives shapes from the static graph.
+        """
+
+        inp = layers.Input(shape=(None,), dtype="int32")
+        x = layers.Embedding(100, 8)(inp)
+        out = layers.Dense(1)(x)
+        model = models.Model(inputs=inp, outputs=out)
+
+        # Call at two different sequence lengths
+        model(ops.zeros((1, 10), dtype="int32"))
+        model(ops.zeros((1, 100), dtype="int32"))
+
+        # Signature must remain fully dynamic from _inputs_struct
+        sig = get_input_signature(model)
+        self.assertEqual(sig[0].shape, (None, None))
+
+        # Export must produce dynamic TFLite shapes
+        temp_filepath = os.path.join(
+            self.get_temp_dir(), "functional_dynamic_shape.tflite"
+        )
+        model.export(temp_filepath, format="litert")
+        self.assertTrue(os.path.exists(temp_filepath))
+
+        interpreter = LiteRTInterpreter(model_path=temp_filepath)
+        interpreter.allocate_tensors()
+        input_details = interpreter.get_input_details()
+        self.assertEqual(len(input_details), 1)
+        # TFLite uses [1, 1] as the default for dynamic dims
+        self.assertEqual(tuple(input_details[0]["shape"]), (1, 1))
+
+    def test_subclass_model_multiple_shape_updates(self):
+        """Successive calls at different shapes update _build_shapes_dict."""
+
+        class TinyLM(models.Model):
+            def __init__(self, vocab_size=100, hidden_dim=16):
+                super().__init__()
+                self.embed = layers.Embedding(vocab_size, hidden_dim)
+                self.dense = layers.Dense(vocab_size)
+
+            def call(self, inputs):
+                x = self.embed(inputs["token_ids"])
+                return self.dense(x)
+
+        model = TinyLM()
+
+        # Three calls at increasing lengths
+        model({"token_ids": ops.zeros((1, 1), dtype="int32")})
+        self.assertEqual(get_input_signature(model)[0]["token_ids"].shape, (None, 1))
+
+        model({"token_ids": ops.zeros((1, 32), dtype="int32")})
+        self.assertEqual(get_input_signature(model)[0]["token_ids"].shape, (None, 32))
+
+        model({"token_ids": ops.zeros((1, 64), dtype="int32")})
+        self.assertEqual(get_input_signature(model)[0]["token_ids"].shape, (None, 64))
+
+        # Final export must use the most recent shape [1, 64]
+        temp_filepath = os.path.join(
+            self.get_temp_dir(), "subclass_multi_update.tflite"
+        )
+        model.export(temp_filepath, format="litert")
+        self.assertTrue(os.path.exists(temp_filepath))
+
+        interpreter = LiteRTInterpreter(model_path=temp_filepath)
+        interpreter.allocate_tensors()
+        input_details = interpreter.get_input_details()
+        self.assertEqual(len(input_details), 1)
+        self.assertEqual(tuple(input_details[0]["shape"]), (1, 64))
+
     def test_dict_input_multi_output_model(self):
         """Test dict input model with multiple outputs exports successfully."""
 
