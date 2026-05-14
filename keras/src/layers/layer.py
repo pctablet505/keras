@@ -1546,9 +1546,20 @@ class Layer(BackendLayer, Operation):
             # shapes from the initial build.  Regular layers and models with
             # custom build() keep the original build shapes to preserve
             # build_from_config semantics.
+            from keras.src.backend.common.stateless_scope import (
+                in_stateless_scope,
+            )
+            from keras.src.backend.common.symbolic_scope import (
+                in_symbolic_scope,
+            )
             from keras.src.models.model import Model
 
-            if isinstance(self, Model) and utils.is_default(self.build):
+            if (
+                isinstance(self, Model)
+                and utils.is_default(self.build)
+                and not in_stateless_scope()
+                and not in_symbolic_scope()
+            ):
                 shapes_dict = get_shapes_dict(call_spec)
                 # Only update with concrete (non-symbolic) shapes.
                 # Symbolic values from torch.export/jax tracing are not
