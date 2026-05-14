@@ -45,14 +45,13 @@ def get_input_signature(model):
             and input_signature
             and isinstance(input_signature[0], dict)
         ):
-            actual_shapes = None
-            for value in shapes_dict.values():
-                if isinstance(value, dict) and set(value.keys()) == set(
-                    input_signature[0].keys()
-                ):
-                    actual_shapes = value
-                    break
-            if actual_shapes is not None:
+            # For Functional models the call argument is always named
+            # ``inputs``, so the recorded shapes dict contains the key
+            # ``inputs_shape``.
+            actual_shapes = shapes_dict.get("inputs_shape")
+            if isinstance(actual_shapes, dict) and set(
+                actual_shapes.keys()
+            ) == set(input_signature[0].keys()):
 
                 def _update_spec(spec, shape):
                     if isinstance(spec, layers.InputSpec):
@@ -62,12 +61,18 @@ def get_input_signature(model):
                             dtype=spec.dtype,
                             name=getattr(spec, "name", None),
                         )
+                    if isinstance(spec, dict):
+                        return {
+                            k: _update_spec(v, shape[k])
+                            for k, v in spec.items()
+                        }
                     return spec
 
-                # Use a plain dict comprehension rather than tree.map_structure
-                # because InputSpec may be registered as a pytree node in some
-                # backends (e.g. TensorFlow/optree) and would not match the
-                # tuple structure of actual_shapes.
+                # Use a plain dict comprehension rather than
+                # tree.map_structure because InputSpec may be registered
+                # as a pytree node in some backends (e.g.
+                # TensorFlow/optree) and would not match the tuple
+                # structure of actual_shapes.
                 input_signature[0] = {
                     k: _update_spec(v, actual_shapes[k])
                     for k, v in input_signature[0].items()

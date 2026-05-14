@@ -1550,7 +1550,13 @@ class Layer(BackendLayer, Operation):
 
             if isinstance(self, Model) and utils.is_default(self.build):
                 shapes_dict = get_shapes_dict(call_spec)
-                self._build_shapes_dict = shapes_dict
+                # Only update with concrete (non-symbolic) shapes.
+                # Symbolic values from torch.export/jax tracing are not
+                # JSON-serializable and would break model.save().
+                if _is_concrete_shapes_dict(shapes_dict):
+                    existing = getattr(self, "_build_shapes_dict", None)
+                    if shapes_dict != existing:
+                        self._build_shapes_dict = shapes_dict
             return
 
         shapes_dict = get_shapes_dict(call_spec)
@@ -1996,6 +2002,27 @@ def get_shapes_dict(call_spec):
         else:
             shapes_dict[f"{k}_shape"] = standardize_shape_or_none(v)
     return shapes_dict
+
+
+def _is_concrete_shapes_dict(shapes_dict):
+    """Return True if every shape value is JSON-safe (int/None/tuple/list).
+
+    During symbolic tracing (torch.export, jax2tf) shapes may contain
+    backend-specific symbolic objects (e.g. torch.SymInt) that are not
+    serializable.  We skip updating ``_build_shapes_dict`` in those
+    cases to avoid breaking ``model.save()``.
+    """
+
+    def _is_concrete(obj):
+        if obj is None or isinstance(obj, int):
+            return True
+        if isinstance(obj, (list, tuple)):
+            return all(_is_concrete(item) for item in obj)
+        if isinstance(obj, dict):
+            return all(_is_concrete(v) for v in obj.values())
+        return False
+
+    return all(_is_concrete(v) for v in shapes_dict.values())
 
 
 def update_shapes_dict_for_target_fn(
