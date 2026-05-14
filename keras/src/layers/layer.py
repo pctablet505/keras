@@ -1560,6 +1560,15 @@ class Layer(BackendLayer, Operation):
                 and not in_stateless_scope()
                 and not in_symbolic_scope()
             ):
+                # Avoid calling get_shapes_dict during torch tracing
+                # (ONNX export, torch.jit.trace) because tensor shapes
+                # become traced scalars and standardize_shape fails on
+                # them.
+                if backend.backend() == "torch":
+                    import torch
+
+                    if torch.jit.is_tracing():
+                        return
                 shapes_dict = get_shapes_dict(call_spec)
                 # Only update with concrete (non-symbolic) shapes.
                 # Symbolic values from torch.export/jax tracing are not
