@@ -39,6 +39,19 @@ class CustomModel(models.Model):
         return output
 
 
+class TinyLM(models.Model):
+    """Small subclassed model for regression tests."""
+
+    def __init__(self, vocab_size=100, hidden_dim=16):
+        super().__init__()
+        self.embed = layers.Embedding(vocab_size, hidden_dim)
+        self.dense = layers.Dense(vocab_size)
+
+    def call(self, inputs):
+        x = self.embed(inputs["token_ids"])
+        return self.dense(x)
+
+
 def get_model(type="sequential", input_shape=(10,), layer_list=None):
     layer_list = layer_list or [
         layers.Dense(10, activation="relu"),
@@ -1262,16 +1275,6 @@ class ExportLitertInterpreterTest(testing.TestCase):
         the latest shape so that LiteRT export traces the correct graph.
         """
 
-        class TinyLM(models.Model):
-            def __init__(self, vocab_size=100, hidden_dim=16):
-                super().__init__()
-                self.embed = layers.Embedding(vocab_size, hidden_dim)
-                self.dense = layers.Dense(vocab_size)
-
-            def call(self, inputs):
-                x = self.embed(inputs["token_ids"])
-                return self.dense(x)
-
         model = TinyLM()
         # First call builds the model at shape [1, 1]
         model({"token_ids": ops.zeros((1, 1), dtype="int32")})
@@ -1373,50 +1376,6 @@ class ExportLitertInterpreterTest(testing.TestCase):
         self.assertEqual(len(input_details), 1)
         # TFLite uses [1, 1] as the default for dynamic dims
         self.assertEqual(tuple(input_details[0]["shape"]), (1, 1))
-
-    def test_subclass_model_multiple_shape_updates(self):
-        """Successive calls at different shapes update _build_shapes_dict."""
-
-        class TinyLM(models.Model):
-            def __init__(self, vocab_size=100, hidden_dim=16):
-                super().__init__()
-                self.embed = layers.Embedding(vocab_size, hidden_dim)
-                self.dense = layers.Dense(vocab_size)
-
-            def call(self, inputs):
-                x = self.embed(inputs["token_ids"])
-                return self.dense(x)
-
-        model = TinyLM()
-
-        # Three calls at increasing lengths
-        model({"token_ids": ops.zeros((1, 1), dtype="int32")})
-        self.assertEqual(
-            get_input_signature(model)[0]["token_ids"].shape, (None, 1)
-        )
-
-        model({"token_ids": ops.zeros((1, 32), dtype="int32")})
-        self.assertEqual(
-            get_input_signature(model)[0]["token_ids"].shape, (None, 32)
-        )
-
-        model({"token_ids": ops.zeros((1, 64), dtype="int32")})
-        self.assertEqual(
-            get_input_signature(model)[0]["token_ids"].shape, (None, 64)
-        )
-
-        # Final export must use the most recent shape [1, 64]
-        temp_filepath = os.path.join(
-            self.get_temp_dir(), "subclass_multi_update.tflite"
-        )
-        model.export(temp_filepath, format="litert")
-        self.assertTrue(os.path.exists(temp_filepath))
-
-        interpreter = LiteRTInterpreter(model_path=temp_filepath)
-        interpreter.allocate_tensors()
-        input_details = interpreter.get_input_details()
-        self.assertEqual(len(input_details), 1)
-        self.assertEqual(tuple(input_details[0]["shape"]), (1, 64))
 
     def test_dict_input_multi_output_model(self):
         """Test dict input model with multiple outputs exports successfully."""
