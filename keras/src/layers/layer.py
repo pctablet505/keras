@@ -20,6 +20,7 @@ import collections
 import functools
 import inspect
 import math
+import numpy as np
 import warnings
 from functools import wraps
 
@@ -1569,7 +1570,12 @@ class Layer(BackendLayer, Operation):
 
                     if torch.jit.is_tracing():
                         return
-                shapes_dict = get_shapes_dict(call_spec)
+                try:
+                    shapes_dict = get_shapes_dict(call_spec)
+                except (TypeError, ValueError):
+                    # During torch.export.export() or other tracing contexts,
+                    # get_shapes_dict may fail on symbolic shapes.
+                    return
                 # Only update with concrete (non-symbolic) shapes.
                 # Symbolic values from torch.export/jax tracing are not
                 # JSON-serializable and would break model.save().
@@ -2034,7 +2040,7 @@ def _is_concrete_shapes_dict(shapes_dict):
     """
 
     def _is_concrete(obj):
-        if obj is None or isinstance(obj, int):
+        if obj is None or isinstance(obj, (int, np.integer)):
             return True
         if isinstance(obj, (list, tuple)):
             return all(_is_concrete(item) for item in obj)

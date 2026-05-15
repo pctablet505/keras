@@ -219,6 +219,10 @@ def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
         else:
             dt = torch.complex64
         return torch.as_tensor(x, dtype=dt, device=get_device())
+    if isinstance(x, (torch.SymInt, torch.SymFloat)):
+        # Scalar symbolic values from torch.export can't go through numpy.
+        dt = to_torch_dtype(dtype) if dtype is not None else None
+        return torch.as_tensor(x, dtype=dt, device=get_device())
 
     # Convert to np in case of any array-like that is not list or tuple.
     # Skip scalar Python values to avoid np.array(float) -> float64, which
@@ -638,10 +642,10 @@ def slice(inputs, start_indices, shape):
         shape, (list, tuple)
     ):
         if all(
-            isinstance(s, (int, torch.SymInt, torch.SymFloat))
+            isinstance(s, (int, torch.SymInt))
             for s in start_indices
         ) and all(
-            isinstance(s, (int, torch.SymInt, torch.SymFloat)) for s in shape
+            isinstance(s, (int, torch.SymInt)) for s in shape
         ):
             slices = [
                 builtins.slice(start_index, start_index + length)
