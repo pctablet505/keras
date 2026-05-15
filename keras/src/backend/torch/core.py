@@ -642,11 +642,8 @@ def slice(inputs, start_indices, shape):
         shape, (list, tuple)
     ):
         if all(
-            isinstance(s, (int, torch.SymInt))
-            for s in start_indices
-        ) and all(
-            isinstance(s, (int, torch.SymInt)) for s in shape
-        ):
+            isinstance(s, (int, torch.SymInt)) for s in start_indices
+        ) and all(isinstance(s, (int, torch.SymInt)) for s in shape):
             slices = [
                 builtins.slice(start_index, start_index + length)
                 for start_index, length in zip(start_indices, shape)

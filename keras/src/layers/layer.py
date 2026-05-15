@@ -20,9 +20,10 @@ import collections
 import functools
 import inspect
 import math
-import numpy as np
 import warnings
 from functools import wraps
+
+import numpy as np
 
 from keras.src import backend
 from keras.src import constraints

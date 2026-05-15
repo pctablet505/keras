@@ -71,7 +71,9 @@ def get_input_signature(model):
                             _update_spec(v, shape[i])
                             for i, v in enumerate(spec)
                         ]
-                        return tuple(result) if isinstance(spec, tuple) else result
+                        return (
+                            tuple(result) if isinstance(spec, tuple) else result
+                        )
                     return spec
 
                 # Use a plain dict comprehension rather than
