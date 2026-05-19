@@ -1302,7 +1302,7 @@ class ExportLitertInterpreterTest(testing.TestCase):
 
         input_details = interpreter.get_input_details()
         self.assertEqual(len(input_details), 1)
-        # TFLite collapses dynamic dims to 1 in get_input_details() output.
+        # Interpreter reflects the static export shape (1, 32).
         self.assertEqual(tuple(input_details[0]["shape"]), (1, 32))
 
     def test_subclass_model_with_custom_build_preserves_original_shape(self):
