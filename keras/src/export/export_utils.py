@@ -55,18 +55,41 @@ def get_input_signature(model):
 
                 def _update_spec(spec, shape):
                     if isinstance(spec, layers.InputSpec):
-                        new_shape = (None,) + tuple(shape)[1:]
+                        original_shape = spec.shape
+                        shape_tuple = tuple(shape)
+                        # Preserve explicit non-None dimensions from the
+                        # original InputSpec (e.g. a fixed sequence length
+                        # set via Input(shape=(None, 128))) while filling
+                        # in concrete values for dynamic dims from the
+                        # most recent call.
+                        if original_shape is not None:
+                            new_shape = tuple(
+                                original_shape[i]
+                                if i < len(original_shape)
+                                and original_shape[i] is not None
+                                else dim
+                                for i, dim in enumerate(shape_tuple)
+                            )
+                        else:
+                            new_shape = shape_tuple
                         return layers.InputSpec(
                             shape=new_shape,
                             dtype=spec.dtype,
                             name=getattr(spec, "name", None),
                         )
                     if isinstance(spec, dict):
+                        if not isinstance(shape, dict):
+                            return spec
                         return {
                             k: _update_spec(v, shape[k])
                             for k, v in spec.items()
+                            if k in shape
                         }
                     if isinstance(spec, (list, tuple)):
+                        if not isinstance(shape, (list, tuple)):
+                            return spec
+                        if len(shape) != len(spec):
+                            return spec
                         result = [
                             _update_spec(v, shape[i])
                             for i, v in enumerate(spec)

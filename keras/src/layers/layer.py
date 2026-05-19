@@ -40,6 +40,7 @@ from keras.src.backend.common import remat
 from keras.src.backend.common.keras_tensor import any_symbolic_tensors
 from keras.src.backend.common.name_scope import current_path
 from keras.src.backend.common.remat import get_current_remat_mode
+from keras.src.backend.common.stateless_scope import in_stateless_scope
 from keras.src.backend.common.symbolic_scope import in_symbolic_scope
 from keras.src.backend.config import is_nnx_enabled
 from keras.src.distribution import distribution_lib
@@ -68,6 +69,10 @@ else:
     raise RuntimeError(
         f"Backend '{backend.backend()}' must implement a layer mixin class."
     )
+
+
+# Lazily cached to avoid circular imports with models.model.
+_Model = None
 
 
 @keras_export(["keras.Layer", "keras.layers.Layer"])
@@ -1542,48 +1547,32 @@ class Layer(BackendLayer, Operation):
 
     def _maybe_build(self, call_spec):
         if self.built:
-            # For models without a custom build(), update _build_shapes_dict
-            # so that export tools (get_input_signature, saved-model serving,
-            # etc.) use the most recent call shapes rather than the stale
-            # shapes from the initial build.  Regular layers and models with
-            # custom build() keep the original build shapes to preserve
-            # build_from_config semantics.
-            from keras.src.backend.common.stateless_scope import (
-                in_stateless_scope,
-            )
-            from keras.src.backend.common.symbolic_scope import (
-                in_symbolic_scope,
-            )
-            from keras.src.models.model import Model
+            # Fast path: skip for regular layers and models with custom build().
+            # Only Functional/Subclassed models that use the default build()
+            # may need their _build_shapes_dict refreshed after a call with
+            # different concrete shapes.
+            global _Model
+            if _Model is None:
+                from keras.src.models.model import Model
 
-            if (
-                isinstance(self, Model)
-                and utils.is_default(self.build)
-                and not in_stateless_scope()
-                and not in_symbolic_scope()
-            ):
-                # Avoid calling get_shapes_dict during torch tracing
-                # (ONNX export, torch.jit.trace) because tensor shapes
-                # become traced scalars and standardize_shape fails on
-                # them.
-                if backend.backend() == "torch":
-                    import torch
-
-                    if torch.jit.is_tracing():
-                        return
-                try:
-                    shapes_dict = get_shapes_dict(call_spec)
-                except (TypeError, ValueError):
-                    # During torch.export.export() or other tracing contexts,
-                    # get_shapes_dict may fail on symbolic shapes.
-                    return
-                # Only update with concrete (non-symbolic) shapes.
-                # Symbolic values from torch.export/jax tracing are not
-                # JSON-serializable and would break model.save().
-                if _is_concrete_shapes_dict(shapes_dict):
-                    existing = getattr(self, "_build_shapes_dict", None)
-                    if shapes_dict != existing:
-                        self._build_shapes_dict = shapes_dict
+                _Model = Model
+            if not isinstance(self, _Model) or not utils.is_default(self.build):
+                return
+            if in_stateless_scope() or in_symbolic_scope():
+                return
+            try:
+                shapes_dict = get_shapes_dict(call_spec)
+            except (TypeError, ValueError):
+                # During torch.export.export() or other tracing contexts,
+                # get_shapes_dict may fail on symbolic shapes.
+                return
+            # Only update with concrete (non-symbolic) shapes.
+            # Symbolic values from torch.export/jax tracing are not
+            # JSON-serializable and would break model.save().
+            if _is_concrete_shapes_dict(shapes_dict):
+                existing = getattr(self, "_build_shapes_dict", None)
+                if shapes_dict != existing:
+                    self._build_shapes_dict = shapes_dict
             return
 
         shapes_dict = get_shapes_dict(call_spec)
