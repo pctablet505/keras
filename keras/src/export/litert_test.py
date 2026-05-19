@@ -1302,7 +1302,7 @@ class ExportLitertInterpreterTest(testing.TestCase):
 
         input_details = interpreter.get_input_details()
         self.assertEqual(len(input_details), 1)
-        # The single input should have shape [1, 32] (batch is dynamic None)
+        # TFLite collapses dynamic dims to 1 in get_input_details() output.
         self.assertEqual(tuple(input_details[0]["shape"]), (1, 32))
 
     def test_subclass_model_with_custom_build_preserves_original_shape(self):
@@ -1317,21 +1317,21 @@ class ExportLitertInterpreterTest(testing.TestCase):
         class CustomBuildModel(models.Model):
             def __init__(self):
                 super().__init__()
-                self.dense = layers.Dense(8)
+                self.embed = layers.Embedding(100, 8)
 
             def build(self, input_shape):
-                self.dense.build(input_shape)
+                self.embed.build(input_shape)
                 self.built = True
 
             def call(self, x):
-                return self.dense(x)
+                return self.embed(x)
 
         model = CustomBuildModel()
-        model.build((None, 10))  # explicit build at feature dim 10
+        model.build((None, 10))  # explicit build at seq_len 10
         original_shapes = dict(model._build_shapes_dict)
 
-        # Subsequent call with different batch but same feature dim
-        model(ops.zeros((2, 10), dtype="float32"))
+        # Subsequent call with different batch AND different seq_len
+        model(ops.zeros((2, 20), dtype="int32"))
 
         # _build_shapes_dict must stay at the original build shape
         self.assertEqual(

@@ -165,6 +165,32 @@ class LiteRTTorchExportTest(testing.TestCase):
         self.assertEqual(len(input_details), 1)
         self.assertEqual(tuple(input_details[0]["shape"]), (1, 32, 4))
 
+    def test_subclass_model_single_tensor_input_signature_reflects_recent_call(
+        self,
+    ):
+        """Subclassed models with single-tensor inputs update signature."""
+
+        class TinyModel(models.Model):
+            def __init__(self):
+                super().__init__()
+                self.dense = layers.Dense(8)
+
+            def call(self, x):
+                return self.dense(x)
+
+        model = TinyModel()
+        model(np.zeros((1, 10, 4), dtype="float32"))
+        model(np.zeros((1, 32, 4), dtype="float32"))
+
+        from keras.src.export.export_utils import get_input_signature
+
+        sig = get_input_signature(model)
+        self.assertEqual(
+            sig[0].shape,
+            (None, 32, 4),
+            "get_input_signature should reflect the most recent call shape",
+        )
+
     def test_conv_model(self):
         model = models.Sequential(
             [
