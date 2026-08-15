@@ -643,6 +643,14 @@ def scatter_update(inputs, indices, updates, reduction=None):
 def slice(inputs, start_indices, shape):
     inputs = convert_to_tensor(inputs)
 
+    if len(start_indices) != len(shape):
+        raise ValueError(
+            "Arguments `start_indices` and `shape` must have the same "
+            "length. Received: "
+            f"start_indices={start_indices} (length {len(start_indices)}), "
+            f"shape={shape} (length {len(shape)})."
+        )
+
     # Fast path: when both start_indices and shape are Python int sequences,
     # build the slice objects directly. This avoids creating tensors from
     # the indices, which would introduce data-dependent expressions that
