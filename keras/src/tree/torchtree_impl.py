@@ -20,64 +20,34 @@ def _tree_is_leaf(tree, is_leaf=None):
     return torch_tree._get_node_type(tree) not in torch_tree.SUPPORTED_NODES
 
 
-def _make_root_is_leaf():
-    # Flatten exactly one level: tree_flatten visits the root first
-    # (depth-first), so treat the first visited node as the root and every
-    # subsequent node (its immediate children) as a leaf. This avoids
-    # comparing `id()` values, which torch.compile cannot trace (dynamo
-    # models `id()` as a compile-time-only value and graph-breaks on the
-    # comparison).
-    seen_root = False
-
-    def _is_child(x):
-        nonlocal seen_root
-        if not seen_root:
-            seen_root = True
-            return False
-        return True
-
-    return _is_child
-
-
 def _dict_to_ordered_dict(structure):
-    # Short-circuit: leaves need no reordering; avoid a torch_tree round-trip.
-    if _tree_is_leaf(structure):
-        return structure
-
-    # We need to sort dict and defaultdict to ensure a deterministic order
-    # that is consistent with other tree implementations. Values are
-    # recursed into here rather than left to traverse_children below, since
-    # a dict match short-circuits traverse_children entirely, and a dict
-    # value that is itself a dict would otherwise keep its insertion order.
-    def func(x):
-        if type(x) is dict:
-            return {k: _dict_to_ordered_dict(x[k]) for k in sorted(x.keys())}
-        elif type(x) is defaultdict:
-            return defaultdict(
-                x.default_factory,
-                {k: _dict_to_ordered_dict(x[k]) for k in sorted(x.keys())},
-            )
-        return None
-
-    def traverse_children():
-        children, treedef = torch_tree.tree_flatten(
-            structure,
-            is_leaf=_make_root_is_leaf(),
+    # We need to sort dict and defaultdict to ensure a deterministic order that
+    # is consistent with other tree implementations. This has to happen at
+    # every level of nesting: if only the outermost level is sorted, two
+    # structurally equal dicts flatten to different leaf orders and
+    # `pack_sequence_as` associates the values with the wrong keys.
+    cls = type(structure)
+    if cls is dict:
+        return {
+            k: _dict_to_ordered_dict(structure[k]) for k in sorted(structure)
+        }
+    if cls is defaultdict:
+        return defaultdict(
+            structure.default_factory,
+            {k: _dict_to_ordered_dict(structure[k]) for k in sorted(structure)},
         )
-        if treedef.num_nodes == 1 and treedef.num_leaves == 1:
-            return structure
-        else:
-            return torch_tree.tree_unflatten(
-                [_dict_to_ordered_dict(c) for c in children],
-                treedef,
-            )
-
-    ret = func(structure)
-    if ret is None:
-        return traverse_children()
-    if isinstance(ret, type) and ret.__name__ == "MAP_TO_NONE":
-        return None
-    return ret
+    node_def = torch_tree.SUPPORTED_NODES.get(
+        torch_tree._get_node_type(structure)
+    )
+    if node_def is None:
+        return structure  # Leaf, nothing to sort.
+    # Other internal node: only rebuild it if a dict below it was reordered.
+    children, context = node_def.flatten_fn(structure)
+    ordered_children = [_dict_to_ordered_dict(c) for c in children]
+    for ordered_child, child in zip(ordered_children, children):
+        if ordered_child is not child:
+            return node_def.unflatten_fn(ordered_children, context)
+    return structure
 
 
 def is_nested(structure):
@@ -85,20 +55,26 @@ def is_nested(structure):
 
 
 def traverse(func, structure, top_down=True):
+    # Sort dicts once, here at the root. `_traverse` below then walks an
+    # already ordered structure and does not redo this at every level.
+    return _traverse(func, _dict_to_ordered_dict(structure), top_down=top_down)
+
+
+def _traverse(func, structure, top_down=True):
     def traverse_children():
+        structure_id = id(structure)
         children, treedef = torch_tree.tree_flatten(
             structure,
-            is_leaf=_make_root_is_leaf(),
+            is_leaf=lambda x: id(x) != structure_id,
         )
         if treedef.num_nodes == 1 and treedef.num_leaves == 1:
             return structure
         else:
             return torch_tree.tree_unflatten(
-                [traverse(func, c, top_down=top_down) for c in children],
+                [_traverse(func, c, top_down=top_down) for c in children],
                 treedef,
             )
 
-    structure = _dict_to_ordered_dict(structure)
     if top_down:
         ret = func(structure)
         if ret is None:
