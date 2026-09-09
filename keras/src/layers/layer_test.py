@@ -2112,7 +2112,9 @@ class LayerTest(testing.TestCase):
             0,
         )
 
-    @parameterized.named_parameters(("true", True), ("none", None))
+    @parameterized.named_parameters(
+        ("true", True), ("false", False), ("none", None)
+    )
     def test_symbolic_call_records_training_kwarg_not_taken_by_call(
         self, training
     ):
@@ -2148,6 +2150,6 @@ class LayerTest(testing.TestCase):
                 y, (x - column_means) / np.sqrt(20.0 + 1e-3), atol=1e-3
             )
         else:
-            # `training=None` never updates the running stats, so they are
-            # still mean 0 / variance 1.
+            # `training=False`/`None` never update the running stats, so
+            # they are still mean 0 / variance 1.
             self.assertAllClose(y, x / np.sqrt(1.0 + 1e-3), atol=1e-3)
