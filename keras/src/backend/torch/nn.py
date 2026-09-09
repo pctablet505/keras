@@ -284,7 +284,7 @@ def _apply_same_padding(
     return tnn.pad(inputs, pad=tuple(flattened_padding), mode=padding_mode), 0
 
 
-def _transpose_spatial_inputs(inputs, channels_last_format=False):
+def _transpose_spatial_inputs(inputs, channels_last_memory_format=False):
     """Transpose inputs from channels_last to channels_first format."""
     # Torch pooling does not support `channels_last` format, so
     # we need to transpose to `channels_first` format.
@@ -292,21 +292,22 @@ def _transpose_spatial_inputs(inputs, channels_last_format=False):
     # failures in view-based ops (e.g., conv2d, torch.export) that
     # require contiguous memory. Adding .contiguous() ensures
     # compatible memory layout.
-    # For 2D/3D conv inputs, `channels_last_format=True` requests the
-    # channels_last memory format directly instead of the standard
-    # contiguous format above: a permuted NHWC->NCHW view of a contiguous
-    # tensor is already channels_last-contiguous, so this is zero-copy.
+    # `channels_last_memory_format` selects torch's channels_last
+    # `memory_format` for the result instead of the default contiguous one.
+    # It does not change the dimension order, which is always channels_first
+    # here: a permuted NHWC->NCHW view of a contiguous tensor already has
+    # channels_last strides, so requesting that format copies nothing.
     ndim = inputs.ndim - 2
     if ndim == 1:  # 1D case
         return torch.permute(inputs, (0, 2, 1)).contiguous()
     elif ndim == 2:  # 2D case
         inputs = torch.permute(inputs, (0, 3, 1, 2))
-        if channels_last_format:
+        if channels_last_memory_format:
             return inputs.contiguous(memory_format=torch.channels_last)
         return inputs.contiguous()
     elif ndim == 3:  # 3D case
         inputs = torch.permute(inputs, (0, 4, 1, 2, 3))
-        if channels_last_format:
+        if channels_last_memory_format:
             return inputs.contiguous(memory_format=torch.channels_last_3d)
         return inputs.contiguous()
     raise ValueError(
@@ -656,10 +657,9 @@ def conv(
         return _conv_pointwise_channels_last(inputs, kernel, strides)
 
     if data_format == "channels_last":
-        # Permute NHWC to NCHW and convert to channels_last memory format
-        # in the same step, since a permuted view of a contiguous tensor
-        # is already channels_last-contiguous and needs no extra copy.
-        inputs = _transpose_spatial_inputs(inputs, channels_last_format=True)
+        inputs = _transpose_spatial_inputs(
+            inputs, channels_last_memory_format=True
+        )
 
     kernel = _transpose_conv_kernel(kernel)
 
