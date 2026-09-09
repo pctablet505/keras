@@ -4671,12 +4671,19 @@ def trunc(x):
 def tile(x, repeats):
     x = get_ov_output(x)
 
-    if isinstance(repeats, int):
+    if isinstance(repeats, int) or (
+        isinstance(repeats, OpenVINOKerasTensor) and repeats.ndim == 0
+    ):
         repeats = [repeats]
-    repeats = get_ov_output(repeats)
+    if isinstance(repeats, (list, tuple)):
+        # `repeats` may mix Python ints with symbolic dimensions,
+        # which cannot be folded into a single constant.
+        repeats = shape_to_ov_output(list(repeats))
+    else:
+        repeats = get_ov_output(repeats)
 
     if repeats.get_element_type() != Type.i64:
-        repeats = ov_opset.convert(repeats, Type.i64)
+        repeats = ov_opset.convert(repeats, Type.i64).output(0)
 
     if len(repeats.get_partial_shape()) != 1:
         repeats = ov_opset.reshape(repeats, [-1], False)
@@ -4897,7 +4904,7 @@ def divide_no_nan(x1, x2):
         element_type = x2.output.get_element_type()
     x1 = get_ov_output(x1, element_type)
     x2 = get_ov_output(x2, element_type)
-    x1, x2 = _align_operand_types(x1, x2, "divide_no_nan()")
+    x1, x2 = _align_operand_types(x1, x2, "divide_no_nan()", force_float=True)
 
     zero = ov_opset.constant(0, x2.get_element_type())
     div = ov_opset.divide(x1, x2)
@@ -4925,6 +4932,19 @@ def power(x1, x2):
     x1 = get_ov_output(x1, element_type)
     x2 = get_ov_output(x2, element_type)
     x1, x2 = _align_operand_types(x1, x2, "power()")
+    return OpenVINOKerasTensor(ov_opset.power(x1, x2).output(0))
+
+
+def float_power(x1, x2):
+    x1 = get_ov_output(x1)
+    x2 = get_ov_output(x2)
+    x1, x2 = _align_operand_types(x1, x2, "float_power()")
+    x1_keras = ov_to_keras_type(x1.get_element_type())
+    x2_keras = ov_to_keras_type(x2.get_element_type())
+    dtype = dtypes.result_type(x1_keras, x2_keras, float)
+    ov_dtype = OPENVINO_DTYPES[dtype]
+    x1 = ov_opset.convert(x1, ov_dtype).output(0)
+    x2 = ov_opset.convert(x2, ov_dtype).output(0)
     return OpenVINOKerasTensor(ov_opset.power(x1, x2).output(0))
 
 
