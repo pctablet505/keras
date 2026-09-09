@@ -1750,26 +1750,6 @@ class Layer(BackendLayer, Operation):
         return layers
 
     def _set_mask_metadata(self, inputs, outputs, previous_mask):
-        if not tree.is_nested(outputs):
-            # Fast path for the common single-tensor output: `outputs` is
-            # its own flat output list, so the `tree.flatten` walks below
-            # are not needed.
-            if backend.get_keras_mask(outputs) is not None:
-                return
-            output_mask = self.compute_mask(inputs, previous_mask)
-            if output_mask is None:
-                return
-            if tree.is_nested(output_mask):
-                # `compute_mask` is expected to mirror `outputs`' structure,
-                # but a custom override may not. Match the general path's
-                # `zip(flat_outputs, flat_masks)` semantics: take the first
-                # flattened mask, or none if the structure is empty.
-                flat_masks = tree.flatten(output_mask)
-                output_mask = flat_masks[0] if flat_masks else None
-            if output_mask is not None:
-                backend.set_keras_mask(outputs, output_mask)
-            return
-
         flat_outputs = tree.flatten(outputs)
 
         mask_already_computed = all(
