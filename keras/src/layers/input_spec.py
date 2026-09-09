@@ -119,6 +119,77 @@ class InputSpec:
         return cls(**config)
 
 
+def assert_input_compatibility(input_spec, inputs, layer_name):
+    """Checks compatibility between the layer and provided inputs.
+
+    This checks that the tensor(s) `inputs` verify the input assumptions
+    of a layer (if any). If not, a clear and actional exception gets raised.
+
+    Args:
+        input_spec: An InputSpec instance, list of InputSpec instances, a nested
+            structure of InputSpec instances, or None.
+        inputs: Input tensor, list of input tensors, or a nested structure of
+            input tensors.
+        layer_name: String, name of the layer (for error message formatting).
+
+    Raises:
+        ValueError: in case of mismatch between
+            the provided inputs and the expectations of the layer.
+    """
+    if not input_spec:
+        return
+
+    # Fast path for the most common case: a single `InputSpec` and a single
+    # tensor input.
+    if isinstance(input_spec, InputSpec) and not tree.is_nested(inputs):
+        if inputs is None and input_spec.optional:
+            return
+        _check_input_spec(input_spec, inputs, 0, layer_name)
+        return
+
+    input_spec = tree.flatten(input_spec)
+    if isinstance(inputs, dict):
+        # Flatten `inputs` by reference order if input spec names are provided
+        names = [spec.name for spec in input_spec]
+        if all(names):
+            list_inputs = []
+            for name in names:
+                if name not in inputs:
+                    raise ValueError(
+                        f'Missing data for input "{name}". '
+                        "You passed a data dictionary with keys "
+                        f"{list(inputs.keys())}. "
+                        f"Expected the following keys: {names}"
+                    )
+                list_inputs.append(inputs[name])
+            inputs = list_inputs
+
+    inputs = tree.flatten(inputs)
+    if len(inputs) != len(input_spec):
+        # Provide appropriate error message for dict inputs.
+        spec_names = [spec.name for spec in input_spec if spec is not None]
+        if len(spec_names) == len(input_spec) and all(spec_names):
+            raise ValueError(
+                f'Layer "{layer_name}" expects {len(input_spec)} named '
+                f"input(s) with keys {spec_names}, but it received "
+                f"{len(inputs)} input tensors. Pass inputs as a dict, e.g. "
+                "`layer({"
+                + ", ".join(f"'{n}': ..." for n in spec_names)
+                + "})`."
+            )
+        raise ValueError(
+            f'Layer "{layer_name}" expects {len(input_spec)} input(s),'
+            f" but it received {len(inputs)} input tensors. "
+            f"Inputs received: {inputs}"
+        )
+    for input_index, (x, spec) in enumerate(zip(inputs, input_spec)):
+        if spec is None:
+            continue
+        if x is None and spec.optional:
+            continue
+        _check_input_spec(spec, x, input_index, layer_name)
+
+
 def _check_input_spec(spec, x, input_index, layer_name):
     """Checks compatibility between a single input and a single `InputSpec`.
 
@@ -233,76 +304,3 @@ def _check_input_spec(spec, x, input_index, layer_name):
                         f"layer: expected shape={spec.shape}, found "
                         f"shape={shape}"
                     )
-
-
-def assert_input_compatibility(input_spec, inputs, layer_name):
-    """Checks compatibility between the layer and provided inputs.
-
-    This checks that the tensor(s) `inputs` verify the input assumptions
-    of a layer (if any). If not, a clear and actional exception gets raised.
-
-    Args:
-        input_spec: An InputSpec instance, list of InputSpec instances, a nested
-            structure of InputSpec instances, or None.
-        inputs: Input tensor, list of input tensors, or a nested structure of
-            input tensors.
-        layer_name: String, name of the layer (for error message formatting).
-
-    Raises:
-        ValueError: in case of mismatch between
-            the provided inputs and the expectations of the layer.
-    """
-    if not input_spec:
-        return
-
-    # Fast path for the most common case: a single `InputSpec` and a single
-    # tensor input. This skips the `tree.flatten` calls and the input count
-    # check. Nested inputs (including any registered pytree) are detected by
-    # `tree.is_nested` and go through the general path below.
-    if isinstance(input_spec, InputSpec) and not tree.is_nested(inputs):
-        if inputs is None and input_spec.optional:
-            return
-        _check_input_spec(input_spec, inputs, 0, layer_name)
-        return
-
-    input_spec = tree.flatten(input_spec)
-    if isinstance(inputs, dict):
-        # Flatten `inputs` by reference order if input spec names are provided
-        names = [spec.name for spec in input_spec]
-        if all(names):
-            list_inputs = []
-            for name in names:
-                if name not in inputs:
-                    raise ValueError(
-                        f'Missing data for input "{name}". '
-                        "You passed a data dictionary with keys "
-                        f"{list(inputs.keys())}. "
-                        f"Expected the following keys: {names}"
-                    )
-                list_inputs.append(inputs[name])
-            inputs = list_inputs
-
-    inputs = tree.flatten(inputs)
-    if len(inputs) != len(input_spec):
-        # Provide appropriate error message for dict inputs.
-        spec_names = [spec.name for spec in input_spec if spec is not None]
-        if len(spec_names) == len(input_spec) and all(spec_names):
-            raise ValueError(
-                f'Layer "{layer_name}" expects {len(input_spec)} named '
-                f"input(s) with keys {spec_names}, but it received "
-                f"{len(inputs)} input tensors. Pass inputs as a dict, e.g. "
-                "`layer({"
-                + ", ".join(f"'{n}': ..." for n in spec_names)
-                + "})`."
-            )
-        raise ValueError(
-            f'Layer "{layer_name}" expects {len(input_spec)} input(s),'
-            f" but it received {len(inputs)} input tensors. "
-            f"Inputs received: {inputs}"
-        )
-    for input_index, (x, spec) in enumerate(zip(inputs, input_spec)):
-        if spec is None:
-            continue
-        if x is None and spec.optional:
-            continue
-        _check_input_spec(spec, x, input_index, layer_name)
