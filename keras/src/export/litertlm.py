@@ -86,71 +86,84 @@ def export_litertlm(
     resolved_spec = resolve_litertlm_spec(model, spec=spec, **kwargs)
 
     # Ensure model is in eval mode to prevent stochastic dropout during tracing
+    was_training = (
+        getattr(model, "training", False) if model is not None else False
+    )
     if model is not None and hasattr(model, "eval") and callable(model.eval):
         model.eval()
 
-    # Validate tokenizer path if provided
-    if resolved_spec.tokenizer_path is not None:
-        tok_path = str(resolved_spec.tokenizer_path)
-        if not os.path.isfile(tok_path) or os.path.islink(tok_path):
-            raise ValueError(
-                f"Tokenizer path must be a valid regular file. Got: {tok_path}"
-            )
-
-    # Build signature map for LiteRT
-    signatures = _build_signatures_map(resolved_spec, torch, model=model)
-
-    quant_config = resolved_spec.quant_config or kwargs.get(
-        "quant_config", None
-    )
-
-    with tempfile.TemporaryDirectory() as temp_dir:
-        tflite_path = os.path.join(temp_dir, "model.tflite")
-
-        # Export multi-signature TFLite model via litert_torch chaining
-        export_litert_via_torch(
-            model=model,
-            filepath=tflite_path,
-            signatures=signatures,
-            quant_config=quant_config,
-            verbose=False,
-        )
-
-        # Build metadata protobuf
-        meta_path = os.path.join(temp_dir, "llm_metadata.pb")
-        _serialize_llm_metadata(resolved_spec, meta_path)
-
-        # Package Task Bundle via litert-lm-builder
-        builder = litert_lm_builder.LitertLmFileBuilder()
-        builder.add_system_metadata(
-            litert_lm_builder.Metadata(
-                key="Authors",
-                value="Keras",
-                dtype=litert_lm_builder.DType.STRING,
-            )
-        )
-        builder.add_tflite_model(
-            tflite_path,
-            litert_lm_builder.TfLiteModelType.PREFILL_DECODE,
-            backend_constraint=resolved_spec.backend_constraint,
-        )
-
-        # Attach tokenizer if provided
+    try:
+        # Validate tokenizer path if provided
         if resolved_spec.tokenizer_path is not None:
             tok_path = str(resolved_spec.tokenizer_path)
-            if tok_path.endswith(".json"):
-                builder.add_hf_tokenizer(tok_path)
-            else:
-                builder.add_sentencepiece_tokenizer(tok_path)
+            if not os.path.isfile(tok_path) or os.path.islink(tok_path):
+                raise ValueError(
+                    "Tokenizer path must be a valid regular file. "
+                    f"Got: {tok_path}"
+                )
 
-        builder.add_llm_metadata(meta_path)
+        # Build signature map for LiteRT
+        signatures = _build_signatures_map(resolved_spec, torch, model=model)
 
-        # Atomic write: stage to temp file and rename
-        staged_bundle_path = os.path.join(temp_dir, "staged.litertlm")
-        with open(staged_bundle_path, "wb") as f:
-            builder.build(f)
+        quant_config = resolved_spec.quant_config or kwargs.get(
+            "quant_config", None
+        )
 
-        os.replace(staged_bundle_path, filepath)
+        with tempfile.TemporaryDirectory(dir=dest_dir or None) as temp_dir:
+            tflite_path = os.path.join(temp_dir, "model.tflite")
+
+            # Export multi-signature TFLite model via litert_torch chaining
+            export_litert_via_torch(
+                model=model,
+                filepath=tflite_path,
+                signatures=signatures,
+                quant_config=quant_config,
+                verbose=False,
+            )
+
+            # Build metadata protobuf
+            meta_path = os.path.join(temp_dir, "llm_metadata.pb")
+            _serialize_llm_metadata(resolved_spec, meta_path)
+
+            # Package Task Bundle via litert-lm-builder
+            builder = litert_lm_builder.LitertLmFileBuilder()
+            builder.add_system_metadata(
+                litert_lm_builder.Metadata(
+                    key="Authors",
+                    value="Keras",
+                    dtype=litert_lm_builder.DType.STRING,
+                )
+            )
+            builder.add_tflite_model(
+                tflite_path,
+                litert_lm_builder.TfLiteModelType.PREFILL_DECODE,
+                backend_constraint=resolved_spec.backend_constraint,
+            )
+
+            # Attach tokenizer if provided
+            if resolved_spec.tokenizer_path is not None:
+                tok_path = str(resolved_spec.tokenizer_path)
+                if tok_path.endswith(".json"):
+                    builder.add_hf_tokenizer(tok_path)
+                else:
+                    builder.add_sentencepiece_tokenizer(tok_path)
+
+            builder.add_llm_metadata(meta_path)
+
+            # Atomic write: stage to temp file on same filesystem and rename
+            staged_bundle_path = os.path.join(temp_dir, "staged.litertlm")
+            with open(staged_bundle_path, "wb") as f:
+                builder.build(f)
+
+            os.replace(staged_bundle_path, filepath)
+    finally:
+        if (
+            was_training
+            and model is not None
+            and hasattr(model, "train")
+            and callable(model.train)
+        ):
+            model.train()
 
     if verbose:
         io_utils.print_msg(f"Saved LiteRT-LM bundle to '{filepath}'.")
@@ -257,6 +270,22 @@ def _build_signatures_map(
     else:
         decode_module = decode_fn.eval()
 
+    def _sanitize_inputs(inputs):
+        if isinstance(inputs, dict):
+            sanitized = dict(inputs)
+            if "tokens" in sanitized and hasattr(sanitized["tokens"], "dtype"):
+                if sanitized["tokens"].dtype == torch.int64:
+                    sanitized["tokens"] = sanitized["tokens"].to(torch.int32)
+            if "input_pos" in sanitized and hasattr(
+                sanitized["input_pos"], "dtype"
+            ):
+                if sanitized["input_pos"].dtype == torch.int64:
+                    sanitized["input_pos"] = sanitized["input_pos"].to(
+                        torch.int32
+                    )
+            return sanitized
+        return inputs
+
     def _get_seq_len(inputs):
         if isinstance(inputs, dict):
             if "tokens" in inputs and hasattr(inputs["tokens"], "shape"):
@@ -267,19 +296,24 @@ def _build_signatures_map(
 
     # Prefill signature(s) - handle bucketing with prefill_{seq_len} standard
     if isinstance(spec.prefill_sample_inputs, list):
-        for idx, inputs in enumerate(spec.prefill_sample_inputs):
+        for idx, raw_inputs in enumerate(spec.prefill_sample_inputs):
+            inputs = _sanitize_inputs(raw_inputs)
             s_len = _get_seq_len(inputs)
             sig_name = (
                 f"prefill_{s_len}" if s_len is not None else f"prefill_{idx}"
             )
             signatures[sig_name] = (prefill_module, inputs)
     else:
-        s_len = _get_seq_len(spec.prefill_sample_inputs)
+        inputs = _sanitize_inputs(spec.prefill_sample_inputs)
+        s_len = _get_seq_len(inputs)
         sig_name = f"prefill_{s_len}" if s_len is not None else "prefill"
-        signatures[sig_name] = (prefill_module, spec.prefill_sample_inputs)
+        signatures[sig_name] = (prefill_module, inputs)
 
     # Decode signature
-    signatures["decode"] = (decode_module, spec.decode_sample_inputs)
+    signatures["decode"] = (
+        decode_module,
+        _sanitize_inputs(spec.decode_sample_inputs),
+    )
 
     # Extra auxiliary signatures (e.g. vision encoder)
     if spec.extra_signatures:
@@ -302,10 +336,16 @@ def _serialize_llm_metadata(spec: LiteRTLMSpec, path: str):
 
     for stop_id in spec.stop_token_ids or []:
         st = meta.stop_tokens.add()
-        if hasattr(st, "token_ids"):
-            st.token_ids.ids.append(int(stop_id))
-        elif hasattr(st, "token_id"):
-            st.token_id = int(stop_id)
+        if isinstance(stop_id, (list, tuple)):
+            if hasattr(st, "token_ids"):
+                st.token_ids.ids.extend([int(x) for x in stop_id])
+            elif hasattr(st, "token_id") and len(stop_id) > 0:
+                st.token_id = int(stop_id[0])
+        else:
+            if hasattr(st, "token_ids"):
+                st.token_ids.ids.append(int(stop_id))
+            elif hasattr(st, "token_id"):
+                st.token_id = int(stop_id)
 
     meta.max_num_tokens = int(spec.context_length)
 
@@ -321,6 +361,12 @@ def _serialize_llm_metadata(spec: LiteRTLMSpec, path: str):
             if model_type in valid_types:
                 getattr(meta.llm_model_type, model_type).SetInParent()
             elif "generic_model" in valid_types:
+                import warnings
+
+                warnings.warn(
+                    f"Model type '{model_type}' is not recognized in "
+                    "LiteRT-LM descriptor. Falling back to 'generic_model'."
+                )
                 meta.llm_model_type.generic_model.SetInParent()
         elif hasattr(meta.llm_model_type, model_type):
             getattr(meta.llm_model_type, model_type).SetInParent()
@@ -337,10 +383,17 @@ class GenericKVAdapter:
     invokes `model.call_with_cache`, and unstacks back to flat outputs.
     """
 
-    def __init__(self, model, num_layers: int, cache_length: int):
+    def __init__(
+        self,
+        model,
+        num_layers: int,
+        cache_length: int,
+        kv_cache_layout: str = "BNTH",
+    ):
         self.model = model
         self.num_layers = num_layers
         self.cache_length = cache_length
+        self.kv_cache_layout = kv_cache_layout
 
     def prefill(self, tokens, input_pos, **kv_cache):
         import torch
@@ -372,6 +425,9 @@ class GenericKVAdapter:
     def _stack_kv_cache(self, kv_cache, torch):
         k_list = [kv_cache[f"kv_cache_k_{i}"] for i in range(self.num_layers)]
         v_list = [kv_cache[f"kv_cache_v_{i}"] for i in range(self.num_layers)]
+        if self.kv_cache_layout == "BNTH":
+            k_list = [k.transpose(1, 2) for k in k_list]
+            v_list = [v.transpose(1, 2) for v in v_list]
         k_stack = torch.stack(k_list, dim=1)
         v_stack = torch.stack(v_list, dim=1)
         return torch.stack([k_stack, v_stack], dim=2)
@@ -379,7 +435,12 @@ class GenericKVAdapter:
     def _unstack_kv_cache(self, cache):
         outputs = {}
         for i in range(self.num_layers):
-            outputs[f"kv_cache_k_{i}"] = cache[:, i, 0, ...].contiguous()
-            outputs[f"kv_cache_v_{i}"] = cache[:, i, 1, ...].contiguous()
+            k = cache[:, i, 0, ...].contiguous()
+            v = cache[:, i, 1, ...].contiguous()
+            if self.kv_cache_layout == "BNTH":
+                k = k.transpose(1, 2).contiguous()
+                v = v.transpose(1, 2).contiguous()
+            outputs[f"kv_cache_k_{i}"] = k
+            outputs[f"kv_cache_v_{i}"] = v
         return outputs
 

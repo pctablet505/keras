@@ -37,6 +37,29 @@ class LiteRTLMSpecTest(testing.TestCase):
         self.assertEqual(spec.stop_token_ids, [1, 2])
         self.assertEqual(spec.model_type, "test_model")
 
+    @unittest.skipUnless(
+        keras.config.backend() == "torch", "Torch backend only"
+    )
+    def test_auto_sample_input_generation(self):
+        config = LiteRTLMSpec(
+            prefill_fn=lambda *args, **kwargs: {},
+            decode_fn=lambda *args, **kwargs: {},
+            context_length=256,
+            num_layers=2,
+            num_kv_heads=4,
+            head_dim=16,
+        )
+        self.assertIsNotNone(config.prefill_sample_inputs)
+        self.assertIsNotNone(config.decode_sample_inputs)
+        self.assertIn("tokens", config.prefill_sample_inputs)
+        self.assertEqual(config.prefill_sample_inputs["tokens"].shape, (1, 128))
+        self.assertEqual(config.decode_sample_inputs["tokens"].shape, (1, 1))
+        # Verify BNTH shape: [1, heads, context, dim]
+        self.assertEqual(
+            config.prefill_sample_inputs["kv_cache_k_0"].shape,
+            (1, 4, 256, 16),
+        )
+
 
 class GenericKVAdapterTest(testing.TestCase):
     @unittest.skipUnless(
@@ -61,7 +84,10 @@ class GenericKVAdapterTest(testing.TestCase):
 
         mock_model = MockModel()
         adapter = GenericKVAdapter(
-            mock_model, num_layers=num_layers, cache_length=cache_length
+            mock_model,
+            num_layers=num_layers,
+            cache_length=cache_length,
+            kv_cache_layout="BTNH",
         )
 
         # Prepare flat inputs
@@ -112,7 +138,9 @@ class GenericKVAdapterTest(testing.TestCase):
                 return torch.zeros((1, 1, 10)), cache
 
         mock_model = Mock2TupleModel()
-        adapter = GenericKVAdapter(mock_model, num_layers=1, cache_length=8)
+        adapter = GenericKVAdapter(
+            mock_model, num_layers=1, cache_length=8, kv_cache_layout="BTNH"
+        )
         tokens = torch.zeros((1, 2), dtype=torch.int32)
         input_pos = torch.tensor([[5, 6]], dtype=torch.int32)  # Rank 2
         kv_cache = {
@@ -122,6 +150,48 @@ class GenericKVAdapterTest(testing.TestCase):
         res = adapter.prefill(tokens, input_pos, **kv_cache)
         self.assertIn("kv_cache_k_0", res)
         self.assertEqual(int(mock_model.received_index), 5)
+
+    @unittest.skipUnless(
+        keras.config.backend() == "torch", "Torch backend only"
+    )
+    def test_adapter_bnth_layout(self):
+        import torch
+
+        num_layers = 2
+        cache_length = 16
+        num_kv_heads = 2
+        head_dim = 8
+
+        class MockModel(torch.nn.Module):
+            def call_with_cache(self, tokens, cache, cache_update_index):
+                self.received_cache_shape = cache.shape
+                return torch.zeros((1, 1, 50)), cache + 1.0
+
+        mock = MockModel()
+        adapter = GenericKVAdapter(
+            mock,
+            num_layers=num_layers,
+            cache_length=cache_length,
+            kv_cache_layout="BNTH",
+        )
+        tokens = torch.zeros((1, 4), dtype=torch.int32)
+        pos = torch.arange(4, dtype=torch.int32)
+        kv = {
+            f"kv_cache_{k}_{i}": torch.zeros(
+                (1, num_kv_heads, cache_length, head_dim)
+            )
+            for i in range(num_layers)
+            for k in ("k", "v")
+        }
+        out = adapter.prefill(tokens, pos, **kv)
+        self.assertEqual(
+            mock.received_cache_shape,
+            (1, 2, 2, cache_length, num_kv_heads, head_dim),
+        )
+        self.assertEqual(
+            out["kv_cache_k_0"].shape,
+            (1, num_kv_heads, cache_length, head_dim),
+        )
 
 
 class ResolveLiteRTLMSpecTest(testing.TestCase):
@@ -256,6 +326,34 @@ class SignatureMapBucketingTest(testing.TestCase):
         self.assertIn("prefill_64", signatures)
         self.assertIn("prefill_128", signatures)
         self.assertIn("decode", signatures)
+
+    @unittest.skipUnless(
+        keras.config.backend() == "torch", "Torch backend only"
+    )
+    def test_sanitize_int64_inputs(self):
+        import torch
+
+        prefill_inputs = {
+            "tokens": torch.zeros((1, 8), dtype=torch.int64),
+            "input_pos": torch.arange(8, dtype=torch.int64),
+        }
+        spec = LiteRTLMSpec(
+            prefill_fn=lambda *args, **kwargs: {},
+            decode_fn=lambda *args, **kwargs: {},
+            prefill_sample_inputs=prefill_inputs,
+            decode_sample_inputs={
+                "tokens": torch.zeros((1, 1), dtype=torch.int64),
+                "input_pos": torch.zeros(1, dtype=torch.int64),
+            },
+            context_length=64,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=8,
+        )
+        sigs = _build_signatures_map(spec, torch)
+        self.assertEqual(sigs["prefill_8"][1]["tokens"].dtype, torch.int32)
+        self.assertEqual(sigs["prefill_8"][1]["input_pos"].dtype, torch.int32)
+        self.assertEqual(sigs["decode"][1]["tokens"].dtype, torch.int32)
 
 
 class ExportLiteRTLMValidationTest(testing.TestCase):

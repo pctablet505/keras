@@ -5,5 +5,6 @@ since your modifications would be overwritten.
 """
 
 from keras.src.export.litertlm import export_litertlm as export_litertlm
+from keras.src.export.litertlm_spec import LiteRTLMConfig as LiteRTLMConfig
 from keras.src.export.litertlm_spec import LiteRTLMSpec as LiteRTLMSpec
 from keras.src.export.saved_model import ExportArchive as ExportArchive
