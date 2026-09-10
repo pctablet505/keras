@@ -891,18 +891,10 @@ class Layer(BackendLayer, Operation):
                 backend.set_keras_mask(y, mask)
             return y
 
-        # `fit()`/`evaluate()`/`predict()` always pass `training=` explicitly,
-        # so a non-empty `kwargs` is not by itself a reason to convert: the
-        # `training=<bool-or-None>` shape holds no array-like leaf for
-        # `maybe_convert` to act on.
+        # `kwargs` is usually a dict with just the `training` argument, which
+        # doesn't need conversion.
         kwargs_may_need_convert = bool(kwargs) and not (
-            len(kwargs) == 1
-            and "training" in kwargs
-            and (
-                kwargs["training"] is True
-                or kwargs["training"] is False
-                or kwargs["training"] is None
-            )
+            len(kwargs) == 1 and "training" in kwargs
         )
 
         # Used to avoid expensive `tree` operations in the most common case.
@@ -914,14 +906,8 @@ class Layer(BackendLayer, Operation):
         ) and self._convert_input_args:
             args = tree.map_structure(maybe_convert, args)
             kwargs = tree.map_structure(maybe_convert, kwargs)
-        elif not kwargs_may_need_convert and kwargs:
-            # Skipping conversion leaves `kwargs` bound to the very dict that
-            # `original_kwargs` refers to, and later steps mutate it: step 5
-            # populates call-context args, step 6 populates masks, and
-            # `CallSpec` pops call-context args that `call()` does not accept.
-            # Copy so the `Node` recorded in step 8 keeps exactly what the
-            # caller passed. (The conversion branch above already rebinds
-            # `kwargs` to a fresh dict, which is what makes it safe there.)
+        else:
+            # `kwargs` get mutated later, so create a copy.
             kwargs = dict(kwargs)
 
         ##########################################################

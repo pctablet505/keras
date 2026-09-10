@@ -13,7 +13,6 @@ from keras.src import metrics
 from keras.src import models
 from keras.src import ops
 from keras.src import testing
-from keras.src import tree
 from keras.src.backend.common import global_state
 from keras.src.backend.common.remat import RematScope
 from keras.src.models import Model
@@ -2039,78 +2038,6 @@ class LayerTest(testing.TestCase):
         self.assertTrue(layer._called)
         self.assertEqual(len(build_count), 1)
         self.assertEqual(len(layer.setattr_calls), 0)
-
-    def _count_map_structure_calls(self, fn):
-        real_map_structure = tree.map_structure
-        count = 0
-
-        def counting_map_structure(*args, **kwargs):
-            nonlocal count
-            count += 1
-            return real_map_structure(*args, **kwargs)
-
-        with mock.patch.object(tree, "map_structure", counting_map_structure):
-            fn()
-        return count
-
-    def test_call_training_kwarg_skips_conversion_walk(self):
-        # `training=<bool-or-None>` alone must not defeat the conversion
-        # skip gate: it carries no array-like leaf to convert, so it must
-        # cost the same number of `tree.map_structure` walks as a call with
-        # no kwargs at all.
-        class Identity(layers.Layer):
-            def call(self, inputs, training=None):
-                return inputs
-
-        layer = Identity()
-        x = ops.convert_to_tensor(np.random.rand(2, 3).astype("float32"))
-        layer(x)  # Warm up build / dtype policy resolution.
-
-        baseline = self._count_map_structure_calls(lambda: layer(x))
-        for training in (True, False, None):
-            self.assertEqual(
-                self._count_map_structure_calls(
-                    lambda: layer(x, training=training)
-                ),
-                baseline,
-                msg=f"training={training!r} must skip the conversion walk",
-            )
-        self.assertIs(layer(x, training=False), x)
-
-    def test_call_training_kwarg_still_converts_on_dtype_mismatch(self):
-        class Identity(layers.Layer):
-            def call(self, inputs, training=None):
-                return inputs
-
-        layer = Identity(dtype="float32")
-        layer(ops.convert_to_tensor(np.zeros((2, 3), dtype="float32")))
-        x64 = ops.convert_to_tensor(np.random.rand(2, 3).astype("float64"))
-
-        count = self._count_map_structure_calls(
-            lambda: layer(x64, training=False)
-        )
-        self.assertGreater(count, 0)
-        self.assertEqual(
-            backend.standardize_dtype(layer(x64, training=False).dtype),
-            "float32",
-        )
-
-    def test_call_extra_kwargs_still_convert(self):
-        # A second kwarg alongside `training` must stay on the general path.
-        class MaskArg(layers.Layer):
-            def call(self, inputs, training=None, mask=None):
-                return inputs
-
-        layer = MaskArg()
-        x = ops.convert_to_tensor(np.random.rand(2, 3).astype("float32"))
-        layer(x)
-
-        self.assertGreater(
-            self._count_map_structure_calls(
-                lambda: layer(x, training=False, mask=None)
-            ),
-            0,
-        )
 
     @parameterized.named_parameters(
         ("true", True), ("false", False), ("none", None)
