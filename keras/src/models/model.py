@@ -773,6 +773,7 @@ class Model(Trainer, base_trainer.Trainer, Layer):
             "onnx",
             "openvino",
             "litert",
+            "litertlm",
             "torch",
         )
         if format not in available_formats:
@@ -790,6 +791,10 @@ class Model(Trainer, base_trainer.Trainer, Layer):
             raise ImportError(
                 "LiteRT export requires TensorFlow or PyTorch backend."
             )
+
+        # Check if LiteRT-LM export is available (requires PyTorch backend)
+        if format == "litertlm" and backend.backend() != "torch":
+            raise ImportError("LiteRT-LM export requires PyTorch backend.")
 
         # Check if Torch export is available (requires PyTorch backend)
         if format == "torch" and backend.backend() != "torch":
@@ -825,6 +830,15 @@ class Model(Trainer, base_trainer.Trainer, Layer):
                 filepath,
                 verbose=verbose,
                 input_signature=input_signature,
+                **kwargs,
+            )
+        elif format == "litertlm":
+            from keras.src.export.litertlm import export_litertlm
+
+            return export_litertlm(
+                model=self,
+                filepath=filepath,
+                verbose=verbose,
                 **kwargs,
             )
         elif format == "torch":

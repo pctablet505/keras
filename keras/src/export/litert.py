@@ -280,47 +280,110 @@ def export_litert_via_torch(
 
     from keras.src.export.export_utils import convert_spec_to_tensor
 
+    signatures = kwargs.pop("signatures", None) or kwargs.pop(
+        "endpoints", None
+    )
+
     original_devices = {}
-    _move_model_to_cpu(model, original_devices, torch)
+    if model is not None:
+        _move_model_to_cpu(model, original_devices, torch)
 
     from keras.src.backend.torch.core import device_scope
 
     with device_scope("cpu"):
         _register_litert_decompositions(torch, litert_torch)
 
-        if input_signature is None:
-            input_signature = get_input_signature(model)
-
-        sample_inputs = tree.map_structure(
-            lambda x: convert_spec_to_tensor(x, replace_none_number=1),
-            input_signature,
-        )
-        sample_inputs = tree.map_structure(
-            lambda t: t.cpu() if hasattr(t, "cpu") else t,
-            sample_inputs,
-        )
-        sample_inputs = tuple(sample_inputs)
-
-        if hasattr(model, "eval"):
-            model.eval()
-
         litert_torch_kwargs = _prepare_litert_kwargs(kwargs, litert_torch)
 
         try:
-            try:
+            if signatures:
+                converter = None
+                for sig_name, sig_def in signatures.items():
+                    if isinstance(sig_def, tuple):
+                        fn, sig_inputs = sig_def
+                    elif isinstance(sig_def, dict):
+                        fn = sig_def.get("fn", model)
+                        sig_inputs = (
+                            sig_def.get("sample_inputs")
+                            or sig_def.get("sample_kwargs")
+                            or sig_def.get("sample_args")
+                        )
+                    else:
+                        fn = sig_def
+                        sig_inputs = None
+
+                    if hasattr(fn, "eval") and callable(fn.eval):
+                        fn.eval()
+
+                    # Format sample inputs
+                    sample_args = None
+                    sample_kwargs = None
+                    if isinstance(sig_inputs, dict):
+                        sample_kwargs = tree.map_structure(
+                            lambda t: t.cpu() if hasattr(t, "cpu") else t,
+                            sig_inputs,
+                        )
+                    elif isinstance(sig_inputs, (list, tuple)):
+                        sample_args = tuple(
+                            tree.map_structure(
+                                lambda t: t.cpu() if hasattr(t, "cpu") else t,
+                                list(sig_inputs),
+                            )
+                        )
+                    elif sig_inputs is not None:
+                        sample_args = (
+                            sig_inputs.cpu()
+                            if hasattr(sig_inputs, "cpu")
+                            else sig_inputs,
+                        )
+
+                    if converter is None:
+                        converter = litert_torch.signature(
+                            sig_name,
+                            fn,
+                            sample_args=sample_args,
+                            sample_kwargs=sample_kwargs,
+                        )
+                    else:
+                        converter = converter.signature(
+                            sig_name,
+                            fn,
+                            sample_args=sample_args,
+                            sample_kwargs=sample_kwargs,
+                        )
+
+                edge_model = converter.convert(**litert_torch_kwargs)
+            else:
+                if input_signature is None:
+                    input_signature = get_input_signature(model)
+
+                sample_inputs = tree.map_structure(
+                    lambda x: convert_spec_to_tensor(x, replace_none_number=1),
+                    input_signature,
+                )
+                sample_inputs = tree.map_structure(
+                    lambda t: t.cpu() if hasattr(t, "cpu") else t,
+                    sample_inputs,
+                )
+                sample_inputs = tuple(sample_inputs)
+
+                if hasattr(model, "eval"):
+                    model.eval()
+
                 edge_model = litert_torch.convert(
                     model, sample_inputs, **litert_torch_kwargs
                 )
-            except Exception as e:
-                raise RuntimeError(
-                    f"Failed to convert PyTorch model to LiteRT. "
-                    f"Common causes: unsupported operations, dynamic shapes, "
-                    f"or complex control flow. Original error: {e}"
-                ) from e
 
             edge_model.export(filepath)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to convert PyTorch model to LiteRT. "
+                f"Common causes: unsupported operations, dynamic shapes, "
+                f"or complex control flow. Original error: {e}"
+            ) from e
         finally:
-            _restore_model_devices(model, original_devices, torch)
+            if model is not None:
+                _restore_model_devices(model, original_devices, torch)
 
     if verbose:
         io_utils.print_msg(f"Saved LiteRT model to {filepath}")
