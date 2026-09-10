@@ -7,11 +7,13 @@ from typing import Dict
 from typing import Optional
 
 from keras.src import backend
+from keras.src.api_export import keras_export
 from keras.src.export.litert import export_litert_via_torch
 from keras.src.export.litertlm_spec import LiteRTLMSpec
 from keras.src.utils import io_utils
 
 
+@keras_export("keras.export.export_litertlm")
 def export_litertlm(
     model=None,
     filepath: str = "model.litertlm",
@@ -45,12 +47,22 @@ def export_litertlm(
             f"backend. Current backend: {backend.backend()}."
         )
 
-    filepath = str(filepath)
+    filepath = os.path.abspath(os.path.expanduser(str(filepath)))
     if not filepath.endswith(".litertlm"):
         raise ValueError(
             "LiteRT-LM export requires a filepath ending in `.litertlm`. "
             f"Received: filepath={filepath}"
         )
+
+    if os.path.islink(filepath):
+        raise ValueError(
+            f"Destination filepath is a symbolic link: {filepath}. "
+            "Writing to symlinks is disallowed for security."
+        )
+
+    dest_dir = os.path.dirname(filepath)
+    if dest_dir:
+        os.makedirs(dest_dir, exist_ok=True)
 
     # Check for required external packages
     try:
@@ -73,8 +85,20 @@ def export_litertlm(
     # Resolve LiteRTLMSpec
     resolved_spec = resolve_litertlm_spec(model, spec=spec, **kwargs)
 
+    # Ensure model is in eval mode to prevent stochastic dropout during tracing
+    if model is not None and hasattr(model, "eval") and callable(model.eval):
+        model.eval()
+
+    # Validate tokenizer path if provided
+    if resolved_spec.tokenizer_path is not None:
+        tok_path = str(resolved_spec.tokenizer_path)
+        if not os.path.isfile(tok_path) or os.path.islink(tok_path):
+            raise ValueError(
+                f"Tokenizer path must be a valid regular file. Got: {tok_path}"
+            )
+
     # Build signature map for LiteRT
-    signatures = _build_signatures_map(resolved_spec, torch)
+    signatures = _build_signatures_map(resolved_spec, torch, model=model)
 
     quant_config = resolved_spec.quant_config or kwargs.get(
         "quant_config", None
@@ -85,7 +109,7 @@ def export_litertlm(
 
         # Export multi-signature TFLite model via litert_torch chaining
         export_litert_via_torch(
-            model=None,
+            model=model,
             filepath=tflite_path,
             signatures=signatures,
             quant_config=quant_config,
@@ -111,17 +135,22 @@ def export_litertlm(
             backend_constraint=resolved_spec.backend_constraint,
         )
 
-        # Attach tokenizer
-        tok_path = str(resolved_spec.tokenizer_path)
-        if tok_path.endswith(".json"):
-            builder.add_hf_tokenizer(tok_path)
-        else:
-            builder.add_sentencepiece_tokenizer(tok_path)
+        # Attach tokenizer if provided
+        if resolved_spec.tokenizer_path is not None:
+            tok_path = str(resolved_spec.tokenizer_path)
+            if tok_path.endswith(".json"):
+                builder.add_hf_tokenizer(tok_path)
+            else:
+                builder.add_sentencepiece_tokenizer(tok_path)
 
         builder.add_llm_metadata(meta_path)
 
-        with open(filepath, "wb") as f:
+        # Atomic write: stage to temp file and rename
+        staged_bundle_path = os.path.join(temp_dir, "staged.litertlm")
+        with open(staged_bundle_path, "wb") as f:
             builder.build(f)
+
+        os.replace(staged_bundle_path, filepath)
 
     if verbose:
         io_utils.print_msg(f"Saved LiteRT-LM bundle to '{filepath}'.")
@@ -153,8 +182,10 @@ def resolve_litertlm_spec(
         "decode_fn",
         "prefill_sample_inputs",
         "decode_sample_inputs",
-        "tokenizer_path",
         "context_length",
+        "num_layers",
+        "num_kv_heads",
+        "head_dim",
     }
     if required_kwargs.issubset(kwargs.keys()):
         return LiteRTLMSpec(
@@ -162,96 +193,90 @@ def resolve_litertlm_spec(
             decode_fn=kwargs["decode_fn"],
             prefill_sample_inputs=kwargs["prefill_sample_inputs"],
             decode_sample_inputs=kwargs["decode_sample_inputs"],
-            tokenizer_path=kwargs["tokenizer_path"],
+            tokenizer_path=kwargs.get("tokenizer_path", None),
             context_length=int(kwargs["context_length"]),
-            num_layers=int(kwargs.get("num_layers", 1)),
-            num_kv_heads=int(kwargs.get("num_kv_heads", 1)),
-            head_dim=int(kwargs.get("head_dim", 64)),
+            num_layers=int(kwargs["num_layers"]),
+            num_kv_heads=int(kwargs["num_kv_heads"]),
+            head_dim=int(kwargs["head_dim"]),
             stop_token_ids=kwargs.get("stop_token_ids", None),
             start_token_id=kwargs.get("start_token_id", None),
             model_type=kwargs.get("model_type", "generic_model"),
             backend_constraint=kwargs.get("backend_constraint", None),
             quant_config=kwargs.get("quant_config", None),
             extra_signatures=kwargs.get("extra_signatures", None),
+            jinja_prompt_template=kwargs.get("jinja_prompt_template", None),
+            kv_cache_layout=kwargs.get("kv_cache_layout", "BTNH"),
         )
-
-    # 4. Duck-typing for models with call_with_cache
-    if model is not None and hasattr(model, "call_with_cache"):
-        return _build_spec_from_causal_lm(model, **kwargs)
 
     raise ValueError(
         "Could not resolve `LiteRTLMSpec` for LiteRT-LM export. Either:\n"
         "1) Pass a pre-constructed `LiteRTLMSpec` via `spec=...`\n"
         "2) Implement a `get_litertlm_spec(**kwargs)` method on model\n"
         "3) Pass the required arguments explicitly: `prefill_fn`, `decode_fn`, "
-        "`prefill_sample_inputs`, `decode_sample_inputs`, `tokenizer_path`, "
-        "and `context_length`."
+        "`prefill_sample_inputs`, `decode_sample_inputs`, `context_length`, "
+        "`num_layers`, `num_kv_heads`, and `head_dim`."
     )
 
 
-def _build_signatures_map(spec: LiteRTLMSpec, torch) -> Dict[str, Any]:
+class ExportSignatureWrapper:
+    """Helper module ensuring parameter sharing across signatures."""
+
+    def __new__(cls, model, fn, torch):
+        class _WrapperModule(torch.nn.Module):
+            def __init__(self, m, f):
+                super().__init__()
+                if isinstance(m, torch.nn.Module):
+                    self.model = m
+                self.fn = f
+
+            def forward(self, *args, **kwargs):
+                return self.fn(*args, **kwargs)
+
+        return _WrapperModule(model, fn)
+
+
+def _build_signatures_map(
+    spec: LiteRTLMSpec, torch, model=None
+) -> Dict[str, Any]:
     """Construct the signature dictionary for multi-signature LiteRT."""
     signatures = {}
 
     prefill_fn = spec.prefill_fn
     decode_fn = spec.decode_fn
 
-    # Wrap callables in torch.nn.Module if needed
+    # Wrap callables in torch.nn.Module to preserve parameter sharing
     if not isinstance(prefill_fn, torch.nn.Module):
-
-        class _PrefillModule(torch.nn.Module):
-            def __init__(self, fn):
-                super().__init__()
-                self.fn = fn
-
-            def forward(self, *args, **kwargs):
-                return self.fn(*args, **kwargs)
-
-        prefill_module = _PrefillModule(prefill_fn).eval()
+        prefill_module = ExportSignatureWrapper(
+            model, prefill_fn, torch
+        ).eval()
     else:
         prefill_module = prefill_fn.eval()
 
     if not isinstance(decode_fn, torch.nn.Module):
-
-        class _DecodeModule(torch.nn.Module):
-            def __init__(self, fn):
-                super().__init__()
-                self.fn = fn
-
-            def forward(self, *args, **kwargs):
-                return self.fn(*args, **kwargs)
-
-        decode_module = _DecodeModule(decode_fn).eval()
+        decode_module = ExportSignatureWrapper(model, decode_fn, torch).eval()
     else:
         decode_module = decode_fn.eval()
 
-    # Prefill signature(s) - handle bucketing
+    def _get_seq_len(inputs):
+        if isinstance(inputs, dict):
+            if "tokens" in inputs and hasattr(inputs["tokens"], "shape"):
+                return inputs["tokens"].shape[-1]
+            if "input_pos" in inputs and hasattr(inputs["input_pos"], "shape"):
+                return inputs["input_pos"].shape[-1]
+        return None
+
+    # Prefill signature(s) - handle bucketing with prefill_{seq_len} standard
     if isinstance(spec.prefill_sample_inputs, list):
-        if len(spec.prefill_sample_inputs) == 1:
-            signatures["prefill"] = (
-                prefill_module,
-                spec.prefill_sample_inputs[0],
+        for idx, inputs in enumerate(spec.prefill_sample_inputs):
+            s_len = _get_seq_len(inputs)
+            sig_name = (
+                f"prefill_{s_len}" if s_len is not None else f"prefill_{idx}"
             )
-        else:
-            for idx, inputs in enumerate(spec.prefill_sample_inputs):
-                seq_len = None
-                if isinstance(inputs, dict):
-                    if "tokens" in inputs and hasattr(
-                        inputs["tokens"], "shape"
-                    ):
-                        seq_len = inputs["tokens"].shape[-1]
-                    elif "input_pos" in inputs and hasattr(
-                        inputs["input_pos"], "shape"
-                    ):
-                        seq_len = inputs["input_pos"].shape[-1]
-                sig_name = (
-                    f"prefill_{seq_len}"
-                    if seq_len is not None
-                    else f"prefill_{idx}"
-                )
-                signatures[sig_name] = (prefill_module, inputs)
+            signatures[sig_name] = (prefill_module, inputs)
     else:
-        signatures["prefill"] = (prefill_module, spec.prefill_sample_inputs)
+        s_len = _get_seq_len(spec.prefill_sample_inputs)
+        sig_name = f"prefill_{s_len}" if s_len is not None else "prefill"
+        signatures[sig_name] = (prefill_module, spec.prefill_sample_inputs)
 
     # Decode signature
     signatures["decode"] = (decode_module, spec.decode_sample_inputs)
@@ -270,20 +295,35 @@ def _serialize_llm_metadata(spec: LiteRTLMSpec, path: str):
     meta = llm_metadata_pb2.LlmMetadata()
 
     if spec.start_token_id is not None:
-        meta.start_token.token_ids.ids.append(int(spec.start_token_id))
+        if hasattr(meta.start_token, "token_ids"):
+            meta.start_token.token_ids.ids.append(int(spec.start_token_id))
+        elif hasattr(meta.start_token, "token_id"):
+            meta.start_token.token_id = int(spec.start_token_id)
 
     for stop_id in spec.stop_token_ids or []:
-        meta.stop_tokens.add().token_ids.ids.append(int(stop_id))
+        st = meta.stop_tokens.add()
+        if hasattr(st, "token_ids"):
+            st.token_ids.ids.append(int(stop_id))
+        elif hasattr(st, "token_id"):
+            st.token_id = int(stop_id)
 
     meta.max_num_tokens = int(spec.context_length)
+
+    if spec.jinja_prompt_template:
+        meta.jinja_prompt_template = str(spec.jinja_prompt_template)
 
     model_type = (
         getattr(spec, "model_type", "generic_model") or "generic_model"
     )
-    if hasattr(meta.llm_model_type, model_type):
-        getattr(meta.llm_model_type, model_type).SetInParent()
-    else:
-        meta.llm_model_type.generic_model.SetInParent()
+    if hasattr(meta, "llm_model_type"):
+        if hasattr(meta.llm_model_type, "DESCRIPTOR"):
+            valid_types = meta.llm_model_type.DESCRIPTOR.fields_by_name
+            if model_type in valid_types:
+                getattr(meta.llm_model_type, model_type).SetInParent()
+            elif "generic_model" in valid_types:
+                meta.llm_model_type.generic_model.SetInParent()
+        elif hasattr(meta.llm_model_type, model_type):
+            getattr(meta.llm_model_type, model_type).SetInParent()
 
     with open(path, "wb") as f:
         f.write(meta.SerializeToString())
@@ -306,10 +346,12 @@ class GenericKVAdapter:
         import torch
 
         cache = self._stack_kv_cache(kv_cache, torch)
-        cache_update_index = input_pos[0]
-        logits, _, updated_cache = self.model.call_with_cache(
-            tokens, cache, cache_update_index
-        )
+        cache_update_index = input_pos.flatten()[0]
+        res = self.model.call_with_cache(tokens, cache, cache_update_index)
+        if len(res) == 3:
+            logits, _, updated_cache = res
+        else:
+            logits, updated_cache = res
         # Prefill signature contract: return ONLY updated KV-cache tensors
         return self._unstack_kv_cache(updated_cache)
 
@@ -317,10 +359,12 @@ class GenericKVAdapter:
         import torch
 
         cache = self._stack_kv_cache(kv_cache, torch)
-        cache_update_index = input_pos.reshape(())
-        logits, _, updated_cache = self.model.call_with_cache(
-            tokens, cache, cache_update_index
-        )
+        cache_update_index = input_pos.flatten()[0]
+        res = self.model.call_with_cache(tokens, cache, cache_update_index)
+        if len(res) == 3:
+            logits, _, updated_cache = res
+        else:
+            logits, updated_cache = res
         outputs = self._unstack_kv_cache(updated_cache)
         outputs["logits"] = logits
         return outputs
@@ -335,137 +379,7 @@ class GenericKVAdapter:
     def _unstack_kv_cache(self, cache):
         outputs = {}
         for i in range(self.num_layers):
-            outputs[f"kv_cache_k_{i}"] = cache[:, i, 0, ...]
-            outputs[f"kv_cache_v_{i}"] = cache[:, i, 1, ...]
+            outputs[f"kv_cache_k_{i}"] = cache[:, i, 0, ...].contiguous()
+            outputs[f"kv_cache_v_{i}"] = cache[:, i, 1, ...].contiguous()
         return outputs
 
-
-def _build_spec_from_causal_lm(model, **kwargs) -> LiteRTLMSpec:
-    """Helper to auto-construct a spec from a model with call_with_cache."""
-    import torch
-
-    backbone = getattr(model, "backbone", model)
-    num_layers = getattr(
-        backbone, "num_layers", getattr(model, "num_layers", None)
-    )
-    if num_layers is None:
-        raise ValueError(
-            "Could not determine `num_layers` from model or backbone."
-        )
-
-    cache_length = getattr(
-        backbone,
-        "max_sequence_length",
-        getattr(model, "max_sequence_length", None),
-    )
-    if cache_length is None and hasattr(model, "preprocessor"):
-        cache_length = getattr(model.preprocessor, "sequence_length", None)
-    if cache_length is None:
-        cache_length = kwargs.get("context_length", 2048)
-
-    num_kv_heads = getattr(
-        backbone,
-        "num_key_value_heads",
-        getattr(
-            backbone, "num_heads", getattr(backbone, "num_query_heads", 1)
-        ),
-    )
-
-    head_dim = getattr(backbone, "head_dim", None)
-    if head_dim is None:
-        hidden_dim = getattr(backbone, "hidden_dim", None)
-        num_qh = getattr(
-            backbone, "num_query_heads", getattr(backbone, "num_heads", None)
-        )
-        if hidden_dim is not None and num_qh is not None and num_qh > 0:
-            head_dim = hidden_dim // num_qh
-    if head_dim is None:
-        head_dim = 64
-
-    # Resolve tokenizer path
-    tokenizer_path = kwargs.get("tokenizer_path", None)
-    if tokenizer_path is None and hasattr(model, "preprocessor"):
-        tok = getattr(model.preprocessor, "tokenizer", None)
-        if tok is not None:
-            tokenizer_path = getattr(
-                tok, "proto", getattr(tok, "model_path", None)
-            )
-            if tokenizer_path is None and hasattr(tok, "assets_dir"):
-                cand = os.path.join(tok.assets_dir, "tokenizer.model")
-                if os.path.exists(cand):
-                    tokenizer_path = cand
-
-    if tokenizer_path is None:
-        raise ValueError(
-            "Could not automatically detect `tokenizer_path` from model. "
-            "Please pass `tokenizer_path=...` explicitly to export."
-        )
-
-    # Stop token IDs
-    stop_token_ids = kwargs.get("stop_token_ids", None)
-    if stop_token_ids is None and hasattr(model, "preprocessor"):
-        tok = getattr(model.preprocessor, "tokenizer", None)
-        if tok is not None:
-            stop_ids = []
-            if getattr(tok, "end_token_id", None) is not None:
-                stop_ids.append(int(tok.end_token_id))
-            if getattr(tok, "end_token2_id", None) is not None:
-                stop_ids.append(int(tok.end_token2_id))
-            stop_token_ids = stop_ids
-
-    adapter = GenericKVAdapter(
-        model, num_layers=num_layers, cache_length=cache_length
-    )
-
-    # Sample inputs
-    prefill_seq_len = kwargs.get("prefill_seq_len", cache_length)
-    if isinstance(prefill_seq_len, int):
-        prefill_seq_lens = [prefill_seq_len]
-    else:
-        prefill_seq_lens = sorted(set(prefill_seq_len))
-
-    prefill_sample_inputs = []
-    for s_len in prefill_seq_lens:
-        sample = {
-            "tokens": torch.zeros((1, s_len), dtype=torch.int32),
-            "input_pos": torch.arange(s_len, dtype=torch.int32),
-        }
-        for i in range(num_layers):
-            sample[f"kv_cache_k_{i}"] = torch.zeros(
-                (1, cache_length, num_kv_heads, head_dim), dtype=torch.float32
-            )
-            sample[f"kv_cache_v_{i}"] = torch.zeros(
-                (1, cache_length, num_kv_heads, head_dim), dtype=torch.float32
-            )
-        prefill_sample_inputs.append(sample)
-
-    decode_sample = {
-        "tokens": torch.zeros((1, 1), dtype=torch.int32),
-        "input_pos": torch.zeros((1,), dtype=torch.int32),
-    }
-    for i in range(num_layers):
-        decode_sample[f"kv_cache_k_{i}"] = torch.zeros(
-            (1, cache_length, num_kv_heads, head_dim), dtype=torch.float32
-        )
-        decode_sample[f"kv_cache_v_{i}"] = torch.zeros(
-            (1, cache_length, num_kv_heads, head_dim), dtype=torch.float32
-        )
-
-    return LiteRTLMSpec(
-        prefill_fn=adapter.prefill,
-        decode_fn=adapter.decode,
-        prefill_sample_inputs=(
-            prefill_sample_inputs
-            if len(prefill_sample_inputs) > 1
-            else prefill_sample_inputs[0]
-        ),
-        decode_sample_inputs=decode_sample,
-        tokenizer_path=tokenizer_path,
-        context_length=cache_length,
-        num_layers=num_layers,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        stop_token_ids=stop_token_ids or [],
-        backend_constraint=kwargs.get("backend_constraint", None),
-        quant_config=kwargs.get("quant_config", None),
-    )

@@ -284,9 +284,28 @@ def export_litert_via_torch(
         "endpoints", None
     )
 
-    original_devices = {}
+    target_models = []
     if model is not None:
-        _move_model_to_cpu(model, original_devices, torch)
+        target_models.append(model)
+    elif signatures:
+        for sig_def in signatures.values():
+            fn = (
+                sig_def[0]
+                if isinstance(sig_def, tuple)
+                else (
+                    sig_def.get("fn")
+                    if isinstance(sig_def, dict)
+                    else sig_def
+                )
+            )
+            if hasattr(fn, "model") and fn.model not in target_models:
+                target_models.append(fn.model)
+            elif hasattr(fn, "parameters") and fn not in target_models:
+                target_models.append(fn)
+
+    original_devices = {}
+    for m in target_models:
+        _move_model_to_cpu(m, original_devices, torch)
 
     from keras.src.backend.torch.core import device_scope
 
@@ -382,8 +401,8 @@ def export_litert_via_torch(
                 f"or complex control flow. Original error: {e}"
             ) from e
         finally:
-            if model is not None:
-                _restore_model_devices(model, original_devices, torch)
+            for m in target_models:
+                _restore_model_devices(m, original_devices, torch)
 
     if verbose:
         io_utils.print_msg(f"Saved LiteRT model to {filepath}")

@@ -100,6 +100,29 @@ class GenericKVAdapterTest(testing.TestCase):
         self.assertIn("kv_cache_k_0", decode_out)
         self.assertEqual(int(mock_model.received_index), 4)
 
+    @unittest.skipUnless(
+        keras.config.backend() == "torch", "Torch backend only"
+    )
+    def test_rank2_input_pos_and_2_tuple_return(self):
+        import torch
+
+        class Mock2TupleModel(torch.nn.Module):
+            def call_with_cache(self, tokens, cache, cache_update_index):
+                self.received_index = cache_update_index
+                return torch.zeros((1, 1, 10)), cache
+
+        mock_model = Mock2TupleModel()
+        adapter = GenericKVAdapter(mock_model, num_layers=1, cache_length=8)
+        tokens = torch.zeros((1, 2), dtype=torch.int32)
+        input_pos = torch.tensor([[5, 6]], dtype=torch.int32)  # Rank 2
+        kv_cache = {
+            "kv_cache_k_0": torch.zeros((1, 8, 1, 8)),
+            "kv_cache_v_0": torch.zeros((1, 8, 1, 8)),
+        }
+        res = adapter.prefill(tokens, input_pos, **kv_cache)
+        self.assertIn("kv_cache_k_0", res)
+        self.assertEqual(int(mock_model.received_index), 5)
+
 
 class ResolveLiteRTLMSpecTest(testing.TestCase):
     def test_resolve_from_direct_spec(self):
@@ -165,41 +188,41 @@ class ResolveLiteRTLMSpecTest(testing.TestCase):
         ):
             resolve_litertlm_spec(model=None)
 
-    @unittest.skipUnless(
-        keras.config.backend() == "torch", "Torch backend only"
-    )
-    def test_resolve_from_duck_typing_causal_lm(self):
-        import torch
-
-        class MockBackbone:
-            num_layers = 4
-            max_sequence_length = 256
-            num_heads = 4
-            head_dim = 32
-
-        class MockTokenizer:
-            model_path = "/tmp/fake_tokenizer.model"
-            end_token_id = 1
-            end_token2_id = 2
-
-        class MockPreprocessor:
-            tokenizer = MockTokenizer()
-
-        class MockCausalLM:
-            backbone = MockBackbone()
-            preprocessor = MockPreprocessor()
-
-            def call_with_cache(self, tokens, cache, cache_update_index):
-                return torch.zeros((1, 1, 10)), None, cache
-
-        model = MockCausalLM()
-        spec = resolve_litertlm_spec(model=model)
-        self.assertEqual(spec.num_layers, 4)
-        self.assertEqual(spec.context_length, 256)
-        self.assertEqual(spec.num_kv_heads, 4)
-        self.assertEqual(spec.head_dim, 32)
-        self.assertEqual(spec.tokenizer_path, "/tmp/fake_tokenizer.model")
-        self.assertEqual(spec.stop_token_ids, [1, 2])
+    def test_bounds_validation(self):
+        with self.assertRaisesRegex(ValueError, "context_length must be > 0"):
+            LiteRTLMSpec(
+                prefill_fn=lambda: None,
+                decode_fn=lambda: None,
+                prefill_sample_inputs={},
+                decode_sample_inputs={},
+                context_length=0,
+                num_layers=1,
+                num_kv_heads=1,
+                head_dim=16,
+            )
+        with self.assertRaisesRegex(ValueError, "num_layers must be > 0"):
+            LiteRTLMSpec(
+                prefill_fn=lambda: None,
+                decode_fn=lambda: None,
+                prefill_sample_inputs={},
+                decode_sample_inputs={},
+                context_length=128,
+                num_layers=-1,
+                num_kv_heads=1,
+                head_dim=16,
+            )
+        with self.assertRaisesRegex(ValueError, "kv_cache_layout must be"):
+            LiteRTLMSpec(
+                prefill_fn=lambda: None,
+                decode_fn=lambda: None,
+                prefill_sample_inputs={},
+                decode_sample_inputs={},
+                context_length=128,
+                num_layers=1,
+                num_kv_heads=1,
+                head_dim=16,
+                kv_cache_layout="INVALID",
+            )
 
 
 class SignatureMapBucketingTest(testing.TestCase):
@@ -240,6 +263,16 @@ class ExportLiteRTLMValidationTest(testing.TestCase):
         with self.assertRaisesRegex(ValueError, "ending in `\\.litertlm`"):
             export_litertlm(filepath="model.tflite")
 
+    def test_symlink_rejection(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            real_file = os.path.join(tmpdir, "real.litertlm")
+            with open(real_file, "w") as f:
+                f.write("test")
+            symlink_file = os.path.join(tmpdir, "symlink.litertlm")
+            os.symlink(real_file, symlink_file)
+            with self.assertRaisesRegex(ValueError, "symbolic link"):
+                export_litertlm(filepath=symlink_file)
+
     @patch("keras.src.backend.backend")
     def test_backend_validation(self, mock_backend):
         mock_backend.return_value = "tensorflow"
@@ -258,18 +291,6 @@ class ExportLiteRTLMValidationTest(testing.TestCase):
     ):
         import torch
 
-        spec = LiteRTLMSpec(
-            prefill_fn=lambda *a, **k: {},
-            decode_fn=lambda *a, **k: {},
-            prefill_sample_inputs={"tokens": torch.zeros((1, 8))},
-            decode_sample_inputs={"tokens": torch.zeros((1, 1))},
-            tokenizer_path="/fake/path/tokenizer.model",
-            context_length=128,
-            num_layers=1,
-            num_kv_heads=1,
-            head_dim=16,
-        )
-
         # Mock litert_lm_builder and litert_torch
         mock_builder_inst = MagicMock()
         mock_litert_lm_builder = MagicMock()
@@ -278,14 +299,30 @@ class ExportLiteRTLMValidationTest(testing.TestCase):
         )
         mock_litert_torch = MagicMock()
 
-        with patch.dict(
-            "sys.modules",
-            {
-                "litert_torch": mock_litert_torch,
-                "litert_lm_builder": mock_litert_lm_builder,
-            },
-        ):
-            with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tok_file = os.path.join(tmpdir, "tokenizer.model")
+            with open(tok_file, "w") as f:
+                f.write("fake_tokenizer")
+
+            spec = LiteRTLMSpec(
+                prefill_fn=lambda *a, **k: {},
+                decode_fn=lambda *a, **k: {},
+                prefill_sample_inputs={"tokens": torch.zeros((1, 8))},
+                decode_sample_inputs={"tokens": torch.zeros((1, 1))},
+                tokenizer_path=tok_file,
+                context_length=128,
+                num_layers=1,
+                num_kv_heads=1,
+                head_dim=16,
+            )
+
+            with patch.dict(
+                "sys.modules",
+                {
+                    "litert_torch": mock_litert_torch,
+                    "litert_lm_builder": mock_litert_lm_builder,
+                },
+            ):
                 out_path = os.path.join(tmpdir, "model.litertlm")
                 result = export_litertlm(spec=spec, filepath=out_path)
 
@@ -294,7 +331,7 @@ class ExportLiteRTLMValidationTest(testing.TestCase):
                 mock_serialize_metadata.assert_called_once()
                 mock_builder_inst.add_tflite_model.assert_called_once()
                 mock_builder_inst.add_sentencepiece_tokenizer.assert_called_with(
-                    "/fake/path/tokenizer.model"
+                    tok_file
                 )
                 mock_builder_inst.build.assert_called_once()
 

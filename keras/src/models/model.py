@@ -666,7 +666,7 @@ class Model(Trainer, base_trainer.Trainer, Layer):
                 artifact.
             format: `str`. The export format. Supported values:
                 `"tf_saved_model"`, `"onnx"`, `"openvino"`, `"litert"`,
-                and `"torch"`.
+                `"litertlm"`, and `"torch"`.
                 Defaults to `"tf_saved_model"`.
             verbose: `bool`. Whether to print a message during export. Defaults
                 to `None`, which uses the default value set by different
@@ -794,7 +794,7 @@ class Model(Trainer, base_trainer.Trainer, Layer):
 
         # Check if LiteRT-LM export is available (requires PyTorch backend)
         if format == "litertlm" and backend.backend() != "torch":
-            raise ImportError("LiteRT-LM export requires PyTorch backend.")
+            raise ValueError("LiteRT-LM export requires PyTorch backend.")
 
         # Check if Torch export is available (requires PyTorch backend)
         if format == "torch" and backend.backend() != "torch":
