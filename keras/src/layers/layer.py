@@ -891,15 +891,24 @@ class Layer(BackendLayer, Operation):
                 backend.set_keras_mask(y, mask)
             return y
 
+        # `kwargs` is usually a dict with just the `training` argument, which
+        # doesn't need conversion.
+        kwargs_may_need_convert = bool(kwargs) and not (
+            len(kwargs) == 1 and "training" in kwargs
+        )
+
         # Used to avoid expensive `tree` operations in the most common case.
         if (
-            kwargs
+            kwargs_may_need_convert
             or len(args) != 1
             or not is_backend_tensor_or_symbolic(args[0], allow_none=False)
             or backend.standardize_dtype(args[0].dtype) != self.input_dtype
         ) and self._convert_input_args:
             args = tree.map_structure(maybe_convert, args)
             kwargs = tree.map_structure(maybe_convert, kwargs)
+        else:
+            # `kwargs` get mutated later, so create a copy.
+            kwargs = dict(kwargs)
 
         ##########################################################
         # 2. Enforce that only tensors can be passed positionally.
