@@ -4847,11 +4847,39 @@ class NumpyTwoInputOpsCorrectnessTest(testing.TestCase):
             np.nanquantile(x4, 0.5, axis=(1, 2)),
         )
 
-    def test_nextafter(self):
-        x = np.array([[1, 2, 3], [3, 2, 1]])
-        y = np.array([[4, 5, 6], [3, 2, 1]])
+    @parameterized.named_parameters(
+        ("float32", "float32"),
+        ("float16", "float16"),
+    )
+    def test_nextafter(self, dtype):
+        x = np.array([[1, 2, 3], [3, 2, 1]], dtype=dtype)
+        y = np.array([[4, 5, 6], [3, 2, 1]], dtype=dtype)
         self.assertAllClose(knp.nextafter(x, y), np.nextafter(x, y))
         self.assertAllClose(knp.Nextafter()(x, y), np.nextafter(x, y))
+
+        # `atol` and `rtol` must be zero because the differences are so small.
+        # Stepping away from an infinity must land on the largest finite
+        # value of the result dtype rather than staying at infinity.
+        x = np.array([np.inf, -np.inf], dtype=dtype)
+        y = np.array([-np.inf, np.inf], dtype=dtype)
+        self.assertAllClose(
+            knp.nextafter(x, y), np.nextafter(x, y), atol=0, rtol=0
+        )
+
+        # Steps near zero are smaller than one ulp of 1.0, so they are lost
+        # if the computation happens in a wider dtype and is cast back.
+        x = np.array([0.0, np.finfo(dtype).tiny], dtype=dtype)
+        y = np.array([1.0, 0.0], dtype=dtype)
+        self.assertAllClose(
+            knp.nextafter(x, y), np.nextafter(x, y), atol=0, rtol=0
+        )
+
+        # A step between ordinary values must move by exactly one ulp.
+        x = np.array([1.0, -1.0], dtype=dtype)
+        y = np.array([2.0, -2.0], dtype=dtype)
+        self.assertAllClose(
+            knp.nextafter(x, y), np.nextafter(x, y), atol=0, rtol=0
+        )
 
     def test_not_equal(self):
         x = np.array([[1, 2], [3, 4]])
@@ -10339,6 +10367,41 @@ class NumpyDtypeTest(testing.TestCase):
             ),
             expected_dtype,
         )
+
+    @parameterized.named_parameters(
+        named_product(
+            dtypes=[
+                ("float32", "int8"),
+                ("float16", "int8"),
+                ("bfloat16", "int8"),
+                ("int8", "float32"),
+            ]
+        )
+    )
+    def test_einsum_mixed_dtypes_at_real_shapes(self, dtypes):
+        # `test_einsum` above uses size-1 operands, which `torch.einsum`
+        # accepts for mixed dtypes even though it rejects them at any real
+        # shape. Check the promotion where it matters: a float operand
+        # against an int8 operand, e.g. an int8 kernel in a quantized layer.
+        dtype1, dtype2 = dtypes
+        if "bfloat16" in dtypes and testing.torch_uses_gpu():
+            self.skipTest("Torch cuda does not support bfloat16")
+
+        subscripts = "abc,cde->abde"
+        rng = np.random.default_rng(0)
+        x1 = knp.array(rng.integers(-4, 5, size=(2, 5, 8)), dtype=dtype1)
+        x2 = knp.array(rng.integers(-4, 5, size=(8, 4, 16)), dtype=dtype2)
+        expected_dtype = backend.result_type(dtype1, dtype2)
+
+        result = knp.einsum(subscripts, x1, x2)
+        self.assertEqual(standardize_dtype(result.dtype), expected_dtype)
+
+        # Values must match a contraction where the int8 operand is cast to
+        # the result dtype explicitly.
+        x1_ref = ops.cast(x1, expected_dtype) if dtype1 == "int8" else x1
+        x2_ref = ops.cast(x2, expected_dtype) if dtype2 == "int8" else x2
+        expected = knp.einsum(subscripts, x1_ref, x2_ref)
+        self.assertAllClose(result, expected)
 
     @parameterized.named_parameters(
         named_product(
