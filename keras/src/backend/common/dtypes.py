@@ -47,8 +47,6 @@ ALLOWED_DTYPES = (
     "complex64",
     "complex128",
 )
-# O(1) membership set for the hot path in standardize_dtype (called 2-4x per
-# layer call). Derived from ALLOWED_DTYPES so the two never drift.
 ALLOWED_DTYPES_SET = frozenset(ALLOWED_DTYPES)
 PYTHON_DTYPES_MAP = {
     bool: "bool",
