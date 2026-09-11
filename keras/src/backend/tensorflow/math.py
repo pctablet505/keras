@@ -326,6 +326,11 @@ def erfinv(x):
             dtype,
         )
 
+    if dtype == "float32":
+        epsilon = tf.constant(1e-7, dtype=tf.float32)
+        clamped_x = tf.clip_by_value(x, -1.0 + epsilon, 1.0 - epsilon)
+        x = tf.where(tf.abs(x) < 1.0, clamped_x, x)
+
     return tf.math.erfinv(x)
 
 
@@ -346,3 +351,13 @@ def gammainc(x1, x2):
     x2 = cast(x2, compute_dtype)
 
     return cast(tf.math.igamma(x1, x2), dtype)
+
+
+def lgamma(x):
+    x = convert_to_tensor(x)
+    dtype = dtypes.result_type(x.dtype, float)
+    if standardize_dtype(dtype) == "bfloat16":
+        return cast(tf.math.lgamma(cast(x, "float32")), dtype)
+    if not tf.as_dtype(x.dtype).is_floating:
+        x = cast(x, dtype)
+    return tf.math.lgamma(x)
