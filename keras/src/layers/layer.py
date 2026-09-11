@@ -324,6 +324,9 @@ class Layer(BackendLayer, Operation):
             "training" in self.call_signature_parameters
         )
         self._call_has_mask_arg = "mask" in self.call_signature_parameters
+        self._call_defaults = single_positional_call_defaults(
+            self._call_signature
+        )
 
         # 1. collect names that should be auto‑propagated
         self._call_context_args = {"training"}
@@ -946,7 +949,11 @@ class Layer(BackendLayer, Operation):
 
         # Caches info about `call()` signature, args, kwargs.
         call_spec = CallSpec(
-            self._call_signature, self._call_context_args, args, kwargs
+            self._call_signature,
+            self._call_context_args,
+            args,
+            kwargs,
+            self._call_defaults,
         )
 
         ############################################
@@ -2016,8 +2023,31 @@ def is_backend_tensor_or_symbolic(x, allow_none=False):
     return backend.is_tensor(x) or isinstance(x, backend.KerasTensor)
 
 
+def single_positional_call_defaults(signature):
+    """Returns `(first_arg_name, defaults)` for a single-input `call()`.
+
+    Most layers have `call(self, inputs)` or `call(self, inputs,
+    training=None, ...)`: one positional argument, everything else defaulted.
+    For those, `signature.bind(x)` always gives `{first_arg_name: x,
+    **defaults}`, which `CallSpec` builds directly instead. Returns `None`
+    for any other signature (no parameters, keyword-only or variadic first
+    parameter, or a later parameter that is required or variadic).
+    """
+    params = list(signature.parameters.values())
+    if (
+        params
+        and params[0].kind
+        in (params[0].POSITIONAL_ONLY, params[0].POSITIONAL_OR_KEYWORD)
+        and all(p.default is not p.empty for p in params[1:])
+    ):
+        return params[0].name, {p.name: p.default for p in params[1:]}
+    return None
+
+
 class CallSpec:
-    def __init__(self, signature, call_context_args, args, kwargs):
+    def __init__(
+        self, signature, call_context_args, args, kwargs, defaults=None
+    ):
         # Strip out user-supplied call-context args that this layer’s `call()`
         # does not accept (otherwise `signature.bind` would raise).
         # This includes built-in args like `training`, and user-defined args.
@@ -2027,19 +2057,27 @@ class CallSpec:
             if context_arg in kwargs and context_arg not in signature.parameters
         }
 
-        bound_args = signature.bind(*args, **kwargs)
+        if defaults is not None and len(args) == 1 and not kwargs:
+            # Fast path for `layer(x)`, the common case: `defaults` (from
+            # `single_positional_call_defaults`) is what `signature.bind`
+            # would return, so bind by hand.
+            first_arg_name, other_defaults = defaults
+            self.user_arguments_dict = {**call_args, first_arg_name: args[0]}
+            arguments = {first_arg_name: args[0], **other_defaults}
+        else:
+            bound_args = signature.bind(*args, **kwargs)
+            # Combine the two dicts.
+            self.user_arguments_dict = {**call_args, **bound_args.arguments}
+            bound_args.apply_defaults()
+            arguments = bound_args.arguments
 
-        # Combine the two dicts.
-        self.user_arguments_dict = {**call_args, **bound_args.arguments}
-
-        bound_args.apply_defaults()
         arg_dict = {}
         arg_names = []
         tensor_arg_dict = {}
         tensor_args = []
         tensor_arg_names = []
         nested_tensor_arg_names = []
-        for name, value in bound_args.arguments.items():
+        for name, value in arguments.items():
             arg_dict[name] = value
             arg_names.append(name)
             if is_backend_tensor_or_symbolic(value):
