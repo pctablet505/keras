@@ -175,6 +175,7 @@ class TorchCoreTest(testing.TestCase):
         out = ep.module()(torch.arange(12).reshape(3, 4))
         self.assertEqual(tuple(out.shape), (3, 2))
 
+
 @pytest.mark.skipif(
     backend.backend() != "torch", reason="Requires torch backend"
 )
