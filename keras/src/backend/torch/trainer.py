@@ -108,8 +108,6 @@ class TorchTrainer(base_trainer.Trainer):
         loss = self._compute_loss(
             x=x, y=y, y_pred=y_pred, sample_weight=sample_weight, training=True
         )
-        # Fast batch-size extraction: avoid tree.flatten for the common case
-        # where x is a plain tensor (dict/list inputs fall back to flatten).
         self._loss_tracker.update_state(
             loss,
             sample_weight=(
@@ -152,8 +150,6 @@ class TorchTrainer(base_trainer.Trainer):
         loss = self._compute_loss(
             x=x, y=y, y_pred=y_pred, sample_weight=sample_weight, training=False
         )
-        # Fast batch-size extraction: avoid tree.flatten for the common case
-        # where x is a plain tensor (dict/list inputs fall back to flatten).
         self._loss_tracker.update_state(
             loss,
             sample_weight=(
