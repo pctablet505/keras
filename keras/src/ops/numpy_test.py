@@ -431,6 +431,11 @@ class NumpyTwoInputOpsDynamicShapeTest(testing.TestCase):
             knp.nanquantile(x, q, axis=1, keepdims=True).shape, (2, None, 1)
         )
 
+    def test_copysign(self):
+        x = KerasTensor((None, 3))
+        y = KerasTensor((1, 3))
+        self.assertEqual(knp.copysign(x, y).shape, (None, 3))
+
     def test_nextafter(self):
         x = KerasTensor((None, 3))
         y = KerasTensor((1, 3))
@@ -1238,6 +1243,15 @@ class NumpyTwoInputOpsStaticShapeTest(testing.TestCase):
             knp.nanquantile(x, q, axis=1, keepdims=True).shape, (2, 3, 1)
         )
 
+    def test_copysign(self):
+        x = KerasTensor((2, 3))
+        y = KerasTensor((2, 3))
+        self.assertEqual(knp.copysign(x, y).shape, (2, 3))
+
+        x = KerasTensor((2, 3))
+        y = KerasTensor((1, 3))
+        self.assertEqual(knp.copysign(x, y).shape, (2, 3))
+
     def test_nextafter(self):
         x = KerasTensor((2, 3))
         y = KerasTensor((2, 3))
@@ -1782,6 +1796,16 @@ class NumpyOneInputOpsDynamicShapeTest(testing.TestCase):
         self.assertEqual(knp.corrcoef(x).shape, (3, 3))
         x = KerasTensor((None, 3))
         self.assertEqual(knp.corrcoef(x).shape, (None, None))
+
+    def test_cov(self):
+        x = KerasTensor((3, None))
+        self.assertEqual(knp.cov(x).shape, (3, 3))
+
+        x = KerasTensor((None, 3))
+        self.assertEqual(knp.cov(x).shape, (None, None))
+
+        with self.assertRaises(ValueError):
+            knp.cov(KerasTensor((2, 3, 4)))
 
     def test_cos(self):
         x = KerasTensor((None, 3))
@@ -4847,11 +4871,61 @@ class NumpyTwoInputOpsCorrectnessTest(testing.TestCase):
             np.nanquantile(x4, 0.5, axis=(1, 2)),
         )
 
-    def test_nextafter(self):
-        x = np.array([[1, 2, 3], [3, 2, 1]])
-        y = np.array([[4, 5, 6], [3, 2, 1]])
+    @parameterized.named_parameters(named_product(BACKEND_AGNOSTIC_OPS))
+    def test_copysign(self, backend_agnostic_ops):
+        backend.config._set_use_backend_agnostic_ops(backend_agnostic_ops)
+        try:
+            x = np.array([[1, -2, 3], [-3, 2, -1]])
+            y = np.array([[-4, 5, -6], [3, -2, 1]])
+            self.assertAllClose(knp.copysign(x, y), np.copysign(x, y))
+            self.assertAllClose(knp.Copysign()(x, y), np.copysign(x, y))
+
+            # Signed zeros and infinities. `assertAllClose` cannot tell -0.0
+            # apart from 0.0, so compare the sign bits directly as well.
+            x = np.array([1.0, -1.0, 0.0, -0.0, np.inf, -np.inf], "float32")
+            y = np.array([-0.0, 0.0, -np.inf, np.inf, 1.0, -1.0], "float32")
+            expected = np.copysign(x, y)
+            self.assertAllClose(knp.copysign(x, y), expected)
+            self.assertAllEqual(
+                np.signbit(self.convert_to_numpy(knp.copysign(x, y))),
+                np.signbit(expected),
+            )
+        finally:
+            backend.config._set_use_backend_agnostic_ops(False)
+
+    @parameterized.named_parameters(
+        ("float32", "float32"),
+        ("float16", "float16"),
+    )
+    def test_nextafter(self, dtype):
+        x = np.array([[1, 2, 3], [3, 2, 1]], dtype=dtype)
+        y = np.array([[4, 5, 6], [3, 2, 1]], dtype=dtype)
         self.assertAllClose(knp.nextafter(x, y), np.nextafter(x, y))
         self.assertAllClose(knp.Nextafter()(x, y), np.nextafter(x, y))
+
+        # `atol` and `rtol` must be zero because the differences are so small.
+        # Stepping away from an infinity must land on the largest finite
+        # value of the result dtype rather than staying at infinity.
+        x = np.array([np.inf, -np.inf], dtype=dtype)
+        y = np.array([-np.inf, np.inf], dtype=dtype)
+        self.assertAllClose(
+            knp.nextafter(x, y), np.nextafter(x, y), atol=0, rtol=0
+        )
+
+        # Steps near zero are smaller than one ulp of 1.0, so they are lost
+        # if the computation happens in a wider dtype and is cast back.
+        x = np.array([0.0, np.finfo(dtype).tiny], dtype=dtype)
+        y = np.array([1.0, 0.0], dtype=dtype)
+        self.assertAllClose(
+            knp.nextafter(x, y), np.nextafter(x, y), atol=0, rtol=0
+        )
+
+        # A step between ordinary values must move by exactly one ulp.
+        x = np.array([1.0, -1.0], dtype=dtype)
+        y = np.array([2.0, -2.0], dtype=dtype)
+        self.assertAllClose(
+            knp.nextafter(x, y), np.nextafter(x, y), atol=0, rtol=0
+        )
 
     def test_not_equal(self):
         x = np.array([[1, 2], [3, 4]])
@@ -6114,6 +6188,27 @@ class NumpyOneInputOpsCorrectnessTest(testing.TestCase):
 
         with self.assertRaises(ValueError):
             knp.Corrcoef().symbolic_call(KerasTensor((2, 3, 5)))
+
+    @parameterized.named_parameters(named_product(BACKEND_AGNOSTIC_OPS))
+    def test_cov(self, backend_agnostic_ops):
+        backend.config._set_use_backend_agnostic_ops(backend_agnostic_ops)
+        try:
+            x = np.array([[1.0, 2.0, 3.0], [3.0, 2.0, 1.0]])
+            self.assertAllClose(knp.cov(x), np.cov(x))
+            self.assertAllClose(knp.Cov()(x), np.cov(x))
+
+            # A 1D input, or a single variable, reduces to the sample
+            # variance.
+            x = np.array([1.0, 4.0, 2.0, 8.0])
+            self.assertAllClose(knp.cov(x), np.cov(x))
+            self.assertAllClose(knp.cov(x[None, :]), np.cov(x[None, :]))
+
+            self.assertTrue(np.isnan(backend.convert_to_numpy(knp.cov(3.0))))
+
+            with self.assertRaises(ValueError):
+                knp.cov(np.ones((2, 3, 4)))
+        finally:
+            backend.config._set_use_backend_agnostic_ops(False)
 
     def test_cos(self):
         x = np.array([[1, 2, 3], [3, 2, 1]])
@@ -10005,6 +10100,28 @@ class NumpyDtypeTest(testing.TestCase):
         )
 
     @parameterized.named_parameters(
+        named_product(BACKEND_AGNOSTIC_OPS, dtype=ALL_DTYPES)
+    )
+    def test_cov(self, backend_agnostic_ops, dtype):
+        import jax.numpy as jnp
+
+        backend.config._set_use_backend_agnostic_ops(backend_agnostic_ops)
+        try:
+            x = knp.ones((2, 4), dtype=dtype)
+            x_jax = jnp.ones((2, 4), dtype=dtype)
+            expected_dtype = standardize_dtype(jnp.cov(x_jax).dtype)
+
+            self.assertEqual(
+                standardize_dtype(knp.cov(x).dtype), expected_dtype
+            )
+            self.assertEqual(
+                standardize_dtype(knp.Cov().symbolic_call(x).dtype),
+                expected_dtype,
+            )
+        finally:
+            backend.config._set_use_backend_agnostic_ops(False)
+
+    @parameterized.named_parameters(
         named_product(dtypes=itertools.combinations(ALL_DTYPES, 2))
     )
     def test_correlate(self, dtypes):
@@ -10339,6 +10456,41 @@ class NumpyDtypeTest(testing.TestCase):
             ),
             expected_dtype,
         )
+
+    @parameterized.named_parameters(
+        named_product(
+            dtypes=[
+                ("float32", "int8"),
+                ("float16", "int8"),
+                ("bfloat16", "int8"),
+                ("int8", "float32"),
+            ]
+        )
+    )
+    def test_einsum_mixed_dtypes_at_real_shapes(self, dtypes):
+        # `test_einsum` above uses size-1 operands, which `torch.einsum`
+        # accepts for mixed dtypes even though it rejects them at any real
+        # shape. Check the promotion where it matters: a float operand
+        # against an int8 operand, e.g. an int8 kernel in a quantized layer.
+        dtype1, dtype2 = dtypes
+        if "bfloat16" in dtypes and testing.torch_uses_gpu():
+            self.skipTest("Torch cuda does not support bfloat16")
+
+        subscripts = "abc,cde->abde"
+        rng = np.random.default_rng(0)
+        x1 = knp.array(rng.integers(-4, 5, size=(2, 5, 8)), dtype=dtype1)
+        x2 = knp.array(rng.integers(-4, 5, size=(8, 4, 16)), dtype=dtype2)
+        expected_dtype = backend.result_type(dtype1, dtype2)
+
+        result = knp.einsum(subscripts, x1, x2)
+        self.assertEqual(standardize_dtype(result.dtype), expected_dtype)
+
+        # Values must match a contraction where the int8 operand is cast to
+        # the result dtype explicitly.
+        x1_ref = ops.cast(x1, expected_dtype) if dtype1 == "int8" else x1
+        x2_ref = ops.cast(x2, expected_dtype) if dtype2 == "int8" else x2
+        expected = knp.einsum(subscripts, x1_ref, x2_ref)
+        self.assertAllClose(result, expected)
 
     @parameterized.named_parameters(
         named_product(
@@ -11882,6 +12034,36 @@ class NumpyDtypeTest(testing.TestCase):
             standardize_dtype(knp.NanToNum().symbolic_call(x).dtype),
             expected_dtype,
         )
+
+    @parameterized.named_parameters(
+        named_product(
+            BACKEND_AGNOSTIC_OPS,
+            dtypes=list(itertools.product(BINARY_DTYPES, BINARY_DTYPES)),
+        )
+    )
+    def test_copysign(self, backend_agnostic_ops, dtypes):
+        import jax.numpy as jnp
+
+        backend.config._set_use_backend_agnostic_ops(backend_agnostic_ops)
+        try:
+            dtype1, dtype2 = dtypes
+            x1 = knp.ones((), dtype=dtype1)
+            x2 = knp.ones((), dtype=dtype2)
+            x1_jax = jnp.ones((), dtype=dtype1)
+            x2_jax = jnp.ones((), dtype=dtype2)
+            expected_dtype = standardize_dtype(
+                jnp.copysign(x1_jax, x2_jax).dtype
+            )
+
+            self.assertEqual(
+                standardize_dtype(knp.copysign(x1, x2).dtype), expected_dtype
+            )
+            self.assertEqual(
+                standardize_dtype(knp.Copysign().symbolic_call(x1, x2).dtype),
+                expected_dtype,
+            )
+        finally:
+            backend.config._set_use_backend_agnostic_ops(False)
 
     @parameterized.named_parameters(
         named_product(
