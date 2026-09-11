@@ -112,7 +112,7 @@ class TorchTrainer(base_trainer.Trainer):
             loss,
             sample_weight=(
                 x.shape[0]
-                if hasattr(x, "shape")
+                if isinstance(x, torch.Tensor)
                 else next(i for i in tree.flatten(x) if i is not None).shape[0]
             ),
         )
@@ -154,7 +154,7 @@ class TorchTrainer(base_trainer.Trainer):
             loss,
             sample_weight=(
                 x.shape[0]
-                if hasattr(x, "shape")
+                if isinstance(x, torch.Tensor)
                 else next(i for i in tree.flatten(x) if i is not None).shape[0]
             ),
         )
