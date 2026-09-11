@@ -6,6 +6,8 @@ import os
 import ml_dtypes
 import numpy as np
 import torch
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import Replicate
 
 from keras.src import tree
 from keras.src.backend.common import KerasVariable
@@ -24,6 +26,26 @@ SUPPORTS_SPARSE_TENSORS = False
 SUPPORTS_RAGGED_TENSORS = False
 SUPPORTS_COMPLEX_DTYPES = True
 IS_THREAD_SAFE = True
+_GLOBAL_DTENSOR_PROMOTION_MODE = None
+_DTENSOR_PROMOTION_ACTIVE = False
+
+
+def activate_dtensor_promotion():
+    global _GLOBAL_DTENSOR_PROMOTION_MODE, _DTENSOR_PROMOTION_ACTIVE
+    if _GLOBAL_DTENSOR_PROMOTION_MODE is None:
+        _GLOBAL_DTENSOR_PROMOTION_MODE = KerasDTensorPromotionMode()
+    if not _DTENSOR_PROMOTION_ACTIVE:
+        _GLOBAL_DTENSOR_PROMOTION_MODE.__enter__()
+        _DTENSOR_PROMOTION_ACTIVE = True
+
+
+def deactivate_dtensor_promotion():
+    global _GLOBAL_DTENSOR_PROMOTION_MODE, _DTENSOR_PROMOTION_ACTIVE
+    if _DTENSOR_PROMOTION_ACTIVE:
+        _GLOBAL_DTENSOR_PROMOTION_MODE.__exit__(None, None, None)
+        _DTENSOR_PROMOTION_ACTIVE = False
+    _GLOBAL_DTENSOR_PROMOTION_MODE = None
+
 
 # Some operators such as 'aten::_foreach_mul_.Scalar'
 # are not currently implemented for the MPS device.
@@ -37,7 +59,12 @@ elif torch.cuda.is_available():
 elif hasattr(torch, "xpu") and torch.xpu.is_available():
     DEFAULT_DEVICE = "xpu"
 else:
-    DEFAULT_DEVICE = "cpu"
+    from keras.src.utils.module_utils import torch_xla
+
+    if torch_xla.available and torch_xla.core.xla_model.xla_device_count() > 0:
+        DEFAULT_DEVICE = "tpu"
+    else:
+        DEFAULT_DEVICE = "cpu"
 
 TORCH_DTYPES = {
     "float16": torch.float16,
@@ -72,7 +99,7 @@ def device_scope(device_name):
 
 
 def get_device():
-    device = getattr(global_state.GLOBAL_STATE_TRACKER, "torch_device", None)
+    device = global_state.get_global_attribute("torch_device", None)
     if device is None:
         return DEFAULT_DEVICE
     return device
@@ -102,8 +129,112 @@ def to_torch_dtype(dtype):
     return standardized_dtype
 
 
+def _promote_tensor_args(args, kwargs, dtensor_arg):
+    """Promotes plain tensors to DTensors using the mesh of dtensor_arg."""
+    mesh = dtensor_arg.device_mesh
+    placements = [Replicate()] * len(mesh.shape)
+
+    def maybe_promote(value):
+        if isinstance(value, torch.Tensor) and not isinstance(value, DTensor):
+            if value.device.type != mesh.device_type:
+                value = value.to(mesh.device_type)
+            return DTensor.from_local(
+                value, device_mesh=mesh, placements=placements
+            )
+        return value
+
+    return tree.map_structure(maybe_promote, (args, kwargs))
+
+
+class KerasDTensorPromotionMode(torch.utils._python_dispatch.TorchDispatchMode):
+    """Dispatch mode that promotes mixed Tensor/DTensor arguments.
+
+    This mode prevents "mixed tensor" errors by intercepting operations where
+    plain tensors and DTensors collide, automatically promoting the plain
+    tensor to a Replicated DTensor.
+    """
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        if kwargs is None:
+            kwargs = {}
+
+        flat_args = tree.flatten((args, kwargs))
+        dtensor_arg = None
+        has_plain_tensor = False
+
+        for arg in flat_args:
+            if isinstance(arg, DTensor):
+                if dtensor_arg is None:
+                    dtensor_arg = arg
+            elif isinstance(arg, torch.Tensor):
+                has_plain_tensor = True
+
+            if dtensor_arg is not None and has_plain_tensor:
+                break
+
+        if dtensor_arg is not None and has_plain_tensor:
+            args, kwargs = _promote_tensor_args(args, kwargs, dtensor_arg)
+
+        return func(*args, **kwargs)
+
+
 class Variable(KerasVariable):
+    def _initialize_distributed(self, initializer):
+        from keras.src.distribution.distribution_lib import distribution
+
+        dist = distribution()
+        if dist is None:
+            return None
+
+        from keras.src.backend.torch import distribution_lib
+
+        if self._layout is None:
+            self._layout = dist.get_variable_layout(self)
+
+        if self._layout is None:
+            return None
+
+        from keras.src.distribution.distribution_lib import TensorLayout
+
+        if isinstance(self._layout, TensorLayout):
+            if all(axis is None for axis in self._layout.axes):
+                return None
+            self._layout = self._layout.backend_layout
+
+        if callable(initializer):
+            value = initializer(self._shape, dtype=self._dtype)
+        else:
+            value = initializer
+
+        if isinstance(value, torch.nn.Parameter):
+            value = value.data
+        if isinstance(value, torch.Tensor) and (
+            value.requires_grad or value.grad_fn is not None
+        ):
+            value = value.detach()
+
+        if isinstance(value, torch.Tensor):
+            if value.device.type != self._layout.device_mesh.device_type:
+                value = value.to(self._layout.device_mesh.device_type)
+
+        dtensor = distribution_lib.distribute_tensor(value, self._layout)
+
+        return torch.nn.Parameter(dtensor, requires_grad=self.trainable)
+
+    def _initialize_with_initializer(self, initializer):
+        value = self._initialize_distributed(initializer)
+        if value is not None:
+            self._value = value
+        else:
+            super()._initialize_with_initializer(initializer)
+
     def _initialize(self, value):
+        self._shape = self._validate_shape(value.shape)
+        new_value = self._initialize_distributed(value)
+        if new_value is not None:
+            self._value = new_value
+            return
+
         if isinstance(value, torch.nn.Parameter):
             # Reuse same parameter
             self._value = value
@@ -114,6 +245,17 @@ class Variable(KerasVariable):
             ).to(get_device())
 
     def _direct_assign(self, value):
+        if isinstance(self.value.data, DTensor):
+            from keras.src.backend.torch import distribution_lib
+            from keras.src.distribution.distribution_lib import TensorLayout
+
+            layout = self._layout
+            if isinstance(layout, TensorLayout):
+                layout = layout.backend_layout
+            if value.device.type != layout.device_mesh.device_type:
+                value = value.to(layout.device_mesh.device_type)
+            value = distribution_lib.distribute_tensor(value, layout)
+
         with torch.no_grad():
             self.value.copy_(value)
 
@@ -190,44 +332,56 @@ class Variable(KerasVariable):
             return False
 
 
-def _tensor_on_device(x, device):
-    """Return True if x already resides on the given device string.
+def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
+    if sparse:
+        raise ValueError("`sparse=True` is not supported with torch backend")
+    if ragged:
+        raise ValueError("`ragged=True` is not supported with torch backend")
+    if isinstance(x, Variable) or is_tensor(x):
+        if isinstance(x, Variable):
+            x = x.value
+        device = get_device()
+        if x.is_meta:
+            x = torch.empty_like(x, device=device)
+        else:
+            x = x.to(device)
+        if dtype is not None:
+            x = x.to(to_torch_dtype(dtype))
+        return x
+    if isinstance(x, (bool, int, float, complex)):
+        if dtype is not None:
+            dt = to_torch_dtype(dtype)
+        elif isinstance(x, bool):
+            dt = torch.bool
+        elif isinstance(x, int):
+            dt = torch.int64 if x < -(2**31) or x >= 2**31 else torch.int32
+        elif isinstance(x, float):
+            dt = to_torch_dtype(floatx())
+        else:
+            dt = torch.complex64
+        return torch.as_tensor(x, dtype=dt, device=get_device())
+    if isinstance(x, (torch.SymInt, torch.SymFloat)):
+        # Scalar symbolic values from torch.export can't go through numpy.
+        dt = to_torch_dtype(dtype) if dtype is not None else None
+        return torch.as_tensor(x, dtype=dt, device=get_device())
 
-    device is an explicit string arg (e.g. "cpu", "cuda", "cuda:1"), not the
-    result of get_device(). For index-less accelerator targets ("cuda", "xpu")
-    we compare x's device index against the runtime's current device, which is
-    stricter than a plain type check (avoids wrongly matching cuda:1 to cuda:0).
-    """
-    tensor_device = x.device
-    target = torch.device(device)
-    if tensor_device.type != target.type:
-        return False
-    if target.index is not None:
-        return tensor_device.index == target.index
-    # Index-less accelerator target: a tensor on such a device implies the
-    # backend is available, so skip the is_available() guard.
-    if target.type == "cuda":
-        return tensor_device.index == torch.cuda.current_device()
-    if target.type == "xpu":
-        return tensor_device.index == torch.xpu.current_device()
-    # CPU and other index-less single-device backends: type match suffices.
-    return True
-
-
-@torch.compiler.disable()
-def _convert_numpy_or_arraylike_to_tensor(x, dtype):
-    """Convert numpy arrays or array-like objects to torch tensors.
-
-    Decorated with @torch.compiler.disable() so that dynamo never tries to
-    trace through numpy ndarray attribute access (e.g. x.dtype), which causes
-    graph breaks. All torch.Tensor / Variable / primitive fast-paths are
-    handled in convert_to_tensor before this function is called.
-    """
     # Convert to np in case of any array-like that is not list or tuple.
     # Skip scalar Python values to avoid np.array(float) -> float64, which
     # causes dtype issues during torch.export (constants are lifted before
     # the cast to the requested dtype).
-    if not isinstance(x, (list, tuple)):
+    if isinstance(x, (list, tuple)):
+        if len(x) > 0 and any(isinstance(x1, torch.Tensor) for x1 in x):
+            # Handle list or tuple of torch tensors
+            return torch.stack([convert_to_tensor(x1) for x1 in x])
+        if len(x) > 0 and any(
+            isinstance(x1, (torch.SymInt, torch.SymFloat))
+            for x1 in tree.flatten(x)
+        ):
+            # Symbolic shape values from torch.export can't go through numpy
+            # and don't have a .dtype attribute. Use torch.as_tensor directly.
+            dt = to_torch_dtype(dtype) if dtype is not None else None
+            return torch.as_tensor(x, dtype=dt, device=get_device())
+    elif not isinstance(x, (bool, int, float)):
         x = np.array(x)
     if isinstance(x, np.ndarray):
         if x.dtype == np.uint32:
@@ -246,86 +400,13 @@ def _convert_numpy_or_arraylike_to_tensor(x, dtype):
     return torch.as_tensor(x, dtype=dtype, device=get_device())
 
 
-def convert_to_tensor(x, dtype=None, sparse=None, ragged=None):
-    # Ultra-fast path covering torch.Tensor and torch.nn.Parameter (the
-    # common case for weights) when no dtype conversion is needed: return
-    # the tensor as-is if it's already on the target device, otherwise move
-    # it there.
-    if (
-        isinstance(x, torch.Tensor)
-        and dtype is None
-        and not sparse
-        and not ragged
-    ):
-        device = get_device()
-        if _tensor_on_device(x, device):
-            return x
-        if x.is_meta:
-            return torch.empty_like(x, device=device)
-        return x.to(device)
-    if sparse:
-        raise ValueError("`sparse=True` is not supported with torch backend")
-    if ragged:
-        raise ValueError("`ragged=True` is not supported with torch backend")
-    if isinstance(x, Variable) or is_tensor(x):
-        if isinstance(x, Variable):
-            x = x.value
-        # Fast path when no dtype conversion is needed and the tensor is
-        # already on the correct device.
-        if dtype is None:
-            device = get_device()
-            if _tensor_on_device(x, device):
-                return x
-            if x.is_meta:
-                return torch.empty_like(x, device=device)
-            return x.to(device)
-        device = get_device()
-        if not _tensor_on_device(x, device):
-            if x.is_meta:
-                x = torch.empty_like(x, device=device)
-            else:
-                x = x.to(device)
-        x = x.to(to_torch_dtype(dtype))
-        return x
-    # Fast path for python primitives — single torch.as_tensor call.
-    if isinstance(x, (bool, int, float, complex)):
-        if dtype is not None:
-            dt = to_torch_dtype(dtype)
-        elif isinstance(x, bool):
-            dt = torch.bool
-        elif isinstance(x, int):
-            dt = torch.int64 if x < -(2**31) or x >= 2**31 else torch.int32
-        elif isinstance(x, float):
-            dt = TORCH_DTYPES[floatx()]
-        else:
-            dt = torch.complex64
-        return torch.as_tensor(x, dtype=dt, device=get_device())
-    if isinstance(x, (torch.SymInt, torch.SymFloat)):
-        # Scalar symbolic values from torch.export can't go through numpy.
-        dt = to_torch_dtype(dtype) if dtype is not None else None
-        return torch.as_tensor(x, dtype=dt, device=get_device())
-
-    # Handle torch.Tensor and SymInt elements in a list/tuple before falling
-    # through to the numpy path.
-    if isinstance(x, (list, tuple)):
-        if len(x) > 0 and any(isinstance(x1, torch.Tensor) for x1 in x):
-            # Handle list or tuple of torch tensors
-            return torch.stack([convert_to_tensor(x1) for x1 in x])
-        if len(x) > 0 and any(
-            isinstance(x1, (torch.SymInt, torch.SymFloat))
-            for x1 in tree.flatten(x)
-        ):
-            # Symbolic shape values from torch.export can't go through numpy
-            # and don't have a .dtype attribute. Use torch.as_tensor directly.
-            dt = to_torch_dtype(dtype) if dtype is not None else None
-            return torch.as_tensor(x, dtype=dt, device=get_device())
-
-    return _convert_numpy_or_arraylike_to_tensor(x, dtype)
-
-
 def convert_to_numpy(x):
     def transform(x):
+        if isinstance(x, Variable):
+            x = x.value
         if is_tensor(x):
+            if isinstance(x, DTensor):
+                x = x.to_local()
             if x.requires_grad:
                 x = x.detach()
             # Tensor has to be moved to CPU before converting to numpy.
@@ -646,7 +727,7 @@ def associative_scan(f, elems, reverse=False, axis=0):
 
 
 def scatter(indices, values, shape):
-    indices = convert_to_tensor(indices)
+    indices = convert_to_tensor(indices, dtype="int64")
     values = convert_to_tensor(values)
     zeros = torch.zeros(shape, dtype=values.dtype, device=get_device())
 
@@ -655,9 +736,12 @@ def scatter(indices, values, shape):
     indices = torch.reshape(indices, [-1, index_length])
     values = torch.reshape(values, [-1] + list(value_shape))
 
-    for i in range(indices.shape[0]):
-        index = indices[i]
-        zeros[tuple(index)] += values[i]
+    # Vectorized scatter-add: index_put_ with accumulate=True applies all
+    # updates in one call and sums duplicate indices, instead of a Python loop
+    # over every index (which is very slow for metrics like MeanIoU that
+    # scatter one update per pixel).
+    idx = tuple(indices.transpose(0, 1))
+    zeros.index_put_(idx, values, accumulate=True)
     return zeros
 
 
@@ -699,19 +783,13 @@ def scatter_update(inputs, indices, updates, reduction=None):
 def _to_static_index(v):
     """Return a Python-level slice bound for `v`, or raise `TypeError`.
 
-    The returned value is usable directly as a Python `slice` bound. Python
-    `int` and `torch.SymInt` are returned unchanged, since calling `int()` on
-    a `SymInt` would specialize a `torch.export` dynamic dimension to a
+    Python `int` and `torch.SymInt` are returned unchanged, since calling
+    `int()` on a `SymInt` specializes a `torch.export` dynamic dimension to a
     constant (#22998); numpy integer scalars are coerced to a Python `int`.
 
-    Floats, tensors, and any other type raise `TypeError` so the caller falls
-    through to the slow `torch.narrow` path. That avoids silently truncating a
-    float bound, and it keeps a tensor bound as a traceable value rather than
-    forcing it into a concrete `int` via `int()`, which would specialize it
-    under `torch.export`/dynamo the same way it would a `SymInt`. Falling back
-    does not by itself avoid a device-to-host sync in eager mode for a 0-d GPU
-    tensor bound, because `torch.narrow` still resolves a tensor `start` to a
-    concrete value internally.
+    Anything else raises `TypeError` so the caller falls through to the
+    `torch.narrow` path, which keeps the bound as a traceable value instead of
+    forcing it to a concrete `int`.
     """
     if isinstance(v, (int, torch.SymInt)):
         return v
@@ -726,20 +804,11 @@ def _to_static_index(v):
 def slice(inputs, start_indices, shape):
     inputs = convert_to_tensor(inputs)
 
-    if len(start_indices) != len(shape):
-        raise ValueError(
-            "Arguments `start_indices` and `shape` must have the same "
-            "length. Received: "
-            f"start_indices={start_indices} (length {len(start_indices)}), "
-            f"shape={shape} (length {len(shape)})."
-        )
-
-    # Fast path: build plain Python slice objects when every bound is a
-    # static integer. _to_static_index raises TypeError for a bound it cannot
-    # turn into one (a float, a tensor, an unsupported type), and a
-    # data-dependent symbolic shape raises RuntimeError under torch.export or
-    # dynamo tracing; either case falls through to the tensor-native slow path
-    # below. The indexing happens in the else clause rather than the try body
+    # Fast path: build plain Python slice objects when every bound is a static
+    # integer. `_to_static_index` raises `TypeError` for a bound it cannot turn
+    # into one, and a data-dependent symbolic shape raises `RuntimeError` under
+    # `torch.export` or dynamo tracing; either case falls through to the
+    # tensor-native slow path below. The indexing happens in the `else` clause
     # so that a genuine indexing error surfaces to the caller instead of being
     # mistaken for an unsupported bound and silently retried on the slow path.
     if isinstance(start_indices, (list, tuple)) and isinstance(

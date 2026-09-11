@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as tnn
 
 from keras.src import backend
+from keras.src.backend.common.backend_utils import canonicalize_axis
 from keras.src.backend.common.backend_utils import check_conv_input_channels
 from keras.src.backend.common.backend_utils import (
     check_conv_transpose_input_channels,
@@ -136,6 +137,7 @@ def celu(x, alpha=1.0):
 
 def glu(x, axis=-1):
     x = convert_to_tensor(x)
+    canonicalize_axis(axis, len(x.shape))
     return tnn.glu(x, dim=axis)
 
 
@@ -208,10 +210,10 @@ def sparsemax(x, axis=-1):
     support = logits_sorted - (logits_cumsum - 1) / r > 0
     # Find the threshold
     k = torch.sum(support, dim=axis, keepdim=True)
-    logits_cumsum_safe = torch.where(
-        support, logits_cumsum, torch.tensor(0.0, device=logits.device)
+    logits_sorted_safe = torch.where(
+        support, logits_sorted, torch.tensor(0.0, device=logits.device)
     )
-    tau = (torch.sum(logits_cumsum_safe, dim=axis, keepdim=True) - 1) / k
+    tau = (torch.sum(logits_sorted_safe, dim=axis, keepdim=True) - 1) / k
     output = torch.clamp(logits - tau, min=0.0)
     return output
 
@@ -222,15 +224,12 @@ def _compute_padding_length(
     """Compute padding length along one dimension with support
     for asymmetric padding."""
     effective_k_size = (kernel_length - 1) * dilation_rate + 1
-    if stride == 1:
-        # total padding is kernel_size - 1
-        total_padding = effective_k_size - 1
-    else:
-        # calc. needed padding for case with stride involved
-        output_size = (input_length + stride - 1) // stride
-        total_padding = max(
-            0, (output_size - 1) * stride + effective_k_size - input_length
-        )
+
+    # calc. needed padding for case with stride involved
+    output_size = (input_length + stride - 1) // stride
+    total_padding = max(
+        0, (output_size - 1) * stride + effective_k_size - input_length
+    )
 
     # divide padding evenly, with extra pixel going at the end if needed
     left_padding = total_padding // 2
@@ -239,7 +238,12 @@ def _compute_padding_length(
 
 
 def _apply_same_padding(
-    inputs, kernel_size, strides, data_format, operation_type, dilation_rate=1
+    inputs,
+    kernel_size,
+    strides,
+    data_format,
+    padding_mode="constant",
+    dilation_rate=1,
 ):
     """Apply same padding to the input tensor.
 
@@ -258,15 +262,13 @@ def _apply_same_padding(
     num_spatial_dims = len(spatial_shape)
     padding = []
 
-    if operation_type != "pooling":
-        dilation_rate = standardize_tuple(
-            dilation_rate, num_spatial_dims, "dilation_rate"
-        )
+    dilation_rate = standardize_tuple(
+        dilation_rate, num_spatial_dims, "dilation_rate"
+    )
 
     for i in range(num_spatial_dims):
-        dil = 1 if operation_type == "pooling" else dilation_rate[i]
         pad = _compute_padding_length(
-            spatial_shape[i], kernel_size[i], strides[i], dil
+            spatial_shape[i], kernel_size[i], strides[i], dilation_rate[i]
         )
         padding.append(pad)
 
@@ -279,11 +281,10 @@ def _apply_same_padding(
     for pad in reversed(padding):
         flattened_padding.extend(pad)
 
-    mode = "replicate" if operation_type == "pooling" else "constant"
-    return tnn.pad(inputs, pad=tuple(flattened_padding), mode=mode), 0
+    return tnn.pad(inputs, pad=tuple(flattened_padding), mode=padding_mode), 0
 
 
-def _transpose_spatial_inputs(inputs):
+def _transpose_spatial_inputs(inputs, channels_last_memory_format=False):
     """Transpose inputs from channels_last to channels_first format."""
     # Torch pooling does not support `channels_last` format, so
     # we need to transpose to `channels_first` format.
@@ -291,13 +292,24 @@ def _transpose_spatial_inputs(inputs):
     # failures in view-based ops (e.g., conv2d, torch.export) that
     # require contiguous memory. Adding .contiguous() ensures
     # compatible memory layout.
+    # `channels_last_memory_format` selects torch's channels_last
+    # `memory_format` for the result instead of the default contiguous one.
+    # It does not change the dimension order, which is always channels_first
+    # here: a permuted NHWC->NCHW view of a contiguous tensor already has
+    # channels_last strides, so requesting that format copies nothing.
     ndim = inputs.ndim - 2
     if ndim == 1:  # 1D case
         return torch.permute(inputs, (0, 2, 1)).contiguous()
     elif ndim == 2:  # 2D case
-        return torch.permute(inputs, (0, 3, 1, 2)).contiguous()
+        inputs = torch.permute(inputs, (0, 3, 1, 2))
+        if channels_last_memory_format:
+            return inputs.contiguous(memory_format=torch.channels_last)
+        return inputs.contiguous()
     elif ndim == 3:  # 3D case
-        return torch.permute(inputs, (0, 4, 1, 2, 3)).contiguous()
+        inputs = torch.permute(inputs, (0, 4, 1, 2, 3))
+        if channels_last_memory_format:
+            return inputs.contiguous(memory_format=torch.channels_last_3d)
+        return inputs.contiguous()
     raise ValueError(
         "Inputs must have ndim=3, 4 or 5, "
         "corresponding to 1D, 2D and 3D inputs. "
@@ -345,6 +357,18 @@ def _maybe_convert_to_channels_last(tensor):
     return tensor
 
 
+def _is_pointwise_kernel(kernel):
+    return all(dim == 1 for dim in kernel.shape[:-2])
+
+
+def _conv_pointwise_channels_last(inputs, kernel, strides):
+    if any(stride != 1 for stride in strides):
+        spatial_slices = tuple(slice(None, None, stride) for stride in strides)
+        inputs = inputs[(slice(None), *spatial_slices, slice(None))]
+    kernel = torch.reshape(kernel, (kernel.shape[-2], kernel.shape[-1]))
+    return torch.matmul(inputs, kernel)
+
+
 def max_pool(
     inputs,
     pool_size,
@@ -369,7 +393,7 @@ def max_pool(
         # Torch does not natively support `"same"` padding, we need to manually
         # apply the right amount of padding to `inputs`.
         inputs, padding = _apply_same_padding(
-            inputs, pool_size, strides, data_format, "pooling"
+            inputs, pool_size, strides, data_format, padding_mode="replicate"
         )
     else:
         padding = 0
@@ -430,6 +454,9 @@ def average_pool(
     if data_format == "channels_last":
         inputs = _transpose_spatial_inputs(inputs)
 
+    orig_inputs = inputs
+    manual_padded = False
+
     if padding == "same":
         # Torch does not natively support `"same"` padding, we need to manually
         # apply the right amount of padding to `inputs`.
@@ -438,8 +465,16 @@ def average_pool(
             pool_size,
             strides,
             "channels_first",  # we're in channels_first here
-            "pooling",
         )
+        if padding == 0:
+            manual_padded = True
+            ones = torch.ones_like(orig_inputs)
+            ones_padded, _ = _apply_same_padding(
+                ones,
+                pool_size,
+                strides,
+                "channels_first",
+            )
     else:
         padding = 0
 
@@ -452,6 +487,14 @@ def average_pool(
             padding=padding,
             count_include_pad=False,
         )
+        if manual_padded:
+            outputs_ones = tnn.avg_pool1d(
+                ones_padded,
+                kernel_size=pool_size,
+                stride=strides,
+                padding=padding,
+                count_include_pad=False,
+            )
     elif num_spatial_dims == 2:
         outputs = tnn.avg_pool2d(
             inputs,
@@ -460,6 +503,14 @@ def average_pool(
             padding=padding,
             count_include_pad=False,
         )
+        if manual_padded:
+            outputs_ones = tnn.avg_pool2d(
+                ones_padded,
+                kernel_size=pool_size,
+                stride=strides,
+                padding=padding,
+                count_include_pad=False,
+            )
     elif num_spatial_dims == 3:
         outputs = tnn.avg_pool3d(
             inputs,
@@ -468,12 +519,23 @@ def average_pool(
             padding=padding,
             count_include_pad=False,
         )
+        if manual_padded:
+            outputs_ones = tnn.avg_pool3d(
+                ones_padded,
+                kernel_size=pool_size,
+                stride=strides,
+                padding=padding,
+                count_include_pad=False,
+            )
     else:
         raise ValueError(
             "Inputs to pooling op must have ndim=3, 4 or 5, "
             "corresponding to 1D, 2D and 3D inputs. "
             f"Received input shape: {inputs.shape}."
         )
+
+    if manual_padded:
+        outputs = outputs / outputs_ones
 
     if orig_format == "channels_last":
         outputs = _transpose_spatial_outputs(outputs)
@@ -584,13 +646,24 @@ def conv(
     strides = standardize_tuple(strides, num_spatial_dims, "strides")
 
     data_format = backend.standardize_data_format(data_format)
+    # Fast path for pointwise channels_last conv: matmul avoids the
+    # channels_first transpose and torch conv dispatch.
+    if (
+        data_format == "channels_last"
+        and padding in {"valid", "same"}
+        and _is_pointwise_kernel(kernel)
+        and inputs.shape[-1] == kernel.shape[-2]
+    ):
+        return _conv_pointwise_channels_last(inputs, kernel, strides)
+
     if data_format == "channels_last":
-        inputs = _transpose_spatial_inputs(inputs)
+        inputs = _transpose_spatial_inputs(
+            inputs, channels_last_memory_format=True
+        )
 
     kernel = _transpose_conv_kernel(kernel)
 
     if data_format == "channels_last":
-        inputs = _maybe_convert_to_channels_last(inputs)
         kernel = _maybe_convert_to_channels_last(kernel)
 
     # calc. groups snippet
@@ -610,8 +683,8 @@ def conv(
             kernel.shape[2:],
             strides,
             data_format,
-            "conv",
-            dilation_rate,
+            padding_mode="constant",
+            dilation_rate=dilation_rate,
         )
     else:
         padding = 0
@@ -1390,6 +1463,18 @@ def _can_use_flash_attention(
     query, key, value, mask=None, is_causal=False, raise_error=False
 ):
     """Verify the availability of flash attention."""
+    if (
+        not raise_error
+        and hasattr(torch.compiler, "is_compiling")
+        and torch.compiler.is_compiling()
+    ):
+        # The probe below constructs a pybind11 `SDPAParams` object, which
+        # dynamo cannot trace, so it breaks the graph at every attention call.
+        # Skipping it is safe: `scaled_dot_product_attention` still selects the
+        # flash kernel when the inputs allow. Auto-detection only, so an
+        # explicit `flash_attention=True` still reports an unsupported input.
+        return False
+
     try:
         from torch.backends.cuda import SDPAParams
         from torch.backends.cuda import can_use_flash_attention

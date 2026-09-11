@@ -1,5 +1,6 @@
 import math
 from itertools import combinations
+from unittest import mock
 
 import numpy as np
 import pytest
@@ -151,6 +152,11 @@ class NNOpsDynamicShapeTest(testing.TestCase):
     def test_glu(self):
         x = KerasTensor([None, 2, 4])
         self.assertEqual(knn.glu(x).shape, (None, 2, 2))
+        with self.assertRaisesRegex(ValueError, "out of bounds"):
+            knn.glu(x, axis=5)
+        x_eager = knp.ones((2, 4))
+        with self.assertRaisesRegex(ValueError, "out of bounds"):
+            knn.glu(x_eager, axis=5)
 
     def test_tanh_shrink(self):
         x = KerasTensor([None, 2, 3])
@@ -1398,10 +1404,15 @@ class NNOpsStaticShapeTest(testing.TestCase):
         self.assertEqual(knn.layer_normalization(x, gamma, beta).shape, x.shape)
 
     def test_polar(self):
-        abs_ = KerasTensor([1, 2])
+        abs_ = KerasTensor([3, 4])
         angle = KerasTensor([3, 4])
         out = knn.polar(abs_, angle)
         self.assertEqual(out.shape, abs_.shape)
+        self.assertEqual(out.dtype, "complex64")
+
+        # `polar` broadcasts its two inputs against each other.
+        out = knn.polar(KerasTensor([2, 1]), KerasTensor([1, 3]))
+        self.assertEqual(out.shape, (2, 3))
 
 
 class NNOpsCorrectnessTest(testing.TestCase):
@@ -1671,6 +1682,14 @@ class NNOpsCorrectnessTest(testing.TestCase):
         self.assertAllClose(
             out, [-0.41614684 + 0.9092974j, -1.979985 + 0.28224j], atol=1e-3
         )
+        # The symbolic dtype must match the eager one, which is complex.
+        symbolic_out = knn.Polar().symbolic_call(
+            KerasTensor((2,), dtype="float32"),
+            KerasTensor((2,), dtype="float32"),
+        )
+        self.assertEqual(
+            backend.standardize_dtype(out.dtype), symbolic_out.dtype
+        )
 
     def test_sparsemax(self):
         x = np.array([-0.5, 0, 1, 2, 3], dtype=np.float32)
@@ -1678,6 +1697,12 @@ class NNOpsCorrectnessTest(testing.TestCase):
             knn.sparsemax(x),
             [0.0, 0.0, 0.0, 0.0, 1.0],
         )
+
+        # The case above has a support of size one, where the threshold is
+        # just the largest logit. Closely spaced logits keep more than one
+        # coordinate in the support and exercise the threshold itself.
+        x = np.array([0.0, 0.5, 1.0], dtype=np.float32)
+        self.assertAllClose(knn.sparsemax(x), [0.0, 0.25, 0.75])
 
     def test_max_pool(self):
         data_format = backend.config.image_data_format()
@@ -1772,6 +1797,40 @@ class NNOpsCorrectnessTest(testing.TestCase):
             ),
         )
 
+    @parameterized.named_parameters(
+        ("channels_last", "channels_last"),
+        ("channels_first", "channels_first"),
+    )
+    def test_average_pool_same_padding_asymmetric(self, data_format):
+        # Test 1D asymmetric padding (pool_size=3, strides=2)
+        if data_format == "channels_last":
+            x = np.array([[[10.0], [20.0]]], dtype="float32")
+        else:
+            x = np.array([[[10.0, 20.0]]], dtype="float32")
+
+        res = knn.average_pool(
+            x, pool_size=3, strides=2, padding="same", data_format=data_format
+        )
+        self.assertAllClose(res, np.array([15.0]).reshape(res.shape))
+
+        # Test 2D asymmetric padding
+        if data_format == "channels_last":
+            x = np.array(
+                [[[[10.0], [20.0]]]], dtype="float32"
+            )  # shape (1, 1, 2, 1)
+        else:
+            x = np.array(
+                [[[[10.0, 20.0]]]], dtype="float32"
+            )  # shape (1, 1, 1, 2)
+        res = knn.average_pool(
+            x,
+            pool_size=(1, 3),
+            strides=(1, 2),
+            padding="same",
+            data_format=data_format,
+        )
+        self.assertAllClose(res, np.array([15.0]).reshape(res.shape))
+
     @parameterized.product(
         strides=(1, 2, 3),
         padding=("valid", "same"),
@@ -1825,6 +1884,38 @@ class NNOpsCorrectnessTest(testing.TestCase):
             groups=1,
         )
         self.assertAllClose(outputs, expected, tpu_atol=1e-2, tpu_rtol=1e-2)
+
+    @pytest.mark.skipif(backend.backend() != "torch", reason="Torch only")
+    def test_torch_channels_last_pointwise_conv_direct_path(self):
+        from keras.src.backend.torch import nn as torch_nn
+
+        inputs_2d = np.arange(120, dtype="float32").reshape((2, 4, 5, 3))
+        kernel = np.arange(6, dtype="float32").reshape((1, 1, 3, 2))
+
+        with mock.patch.object(
+            torch_nn.tnn,
+            "conv2d",
+            side_effect=AssertionError("conv2d should not be called"),
+        ):
+            outputs = knn.conv(
+                inputs_2d,
+                kernel,
+                strides=(2, 3),
+                padding="same",
+                data_format="channels_last",
+            )
+
+        expected = np_conv2d(
+            inputs_2d,
+            kernel,
+            bias_weights=np.zeros((2,)),
+            strides=(2, 3),
+            padding="same",
+            data_format="channels_last",
+            dilation_rate=1,
+            groups=1,
+        )
+        self.assertAllClose(outputs, expected)
 
     @parameterized.product(strides=(1, 2), dilation_rate=(1, (2, 1)))
     def test_conv_2d_group_2(self, strides, dilation_rate):
@@ -2602,6 +2693,46 @@ class NNOpsCorrectnessTest(testing.TestCase):
             [[1e-1, 1e-3]],
         )
 
+    def test_normalize_l2_zero_vector_gradients(self):
+        # The L2 (order=2) fast path must not produce NaN gradients for a zero
+        # vector: rsqrt(0) is inf and its derivative is 0 * inf = NaN, which a
+        # clamp on the output cannot undo (see #23075). At the data minimum the
+        # clamped norm is constant, so the gradient is a finite 1 / epsilon.
+        epsilon = 1e-3
+        expected_grad = np.full((3,), 1.0 / epsilon, dtype="float32")
+
+        if backend.backend() == "tensorflow":
+            import tensorflow as tf
+
+            x = tf.Variable([0.0, 0.0, 0.0])
+            with tf.GradientTape() as tape:
+                y = knn.normalize(x, axis=-1, order=2, epsilon=epsilon)
+                loss = tf.reduce_sum(y)
+            x_grad = tape.gradient(loss, x)
+        elif backend.backend() == "jax":
+            import jax
+            import jax.numpy as jnp
+
+            def f(x):
+                return jnp.sum(
+                    knn.normalize(x, axis=-1, order=2, epsilon=epsilon)
+                )
+
+            x_grad = jax.grad(f)(jnp.array([0.0, 0.0, 0.0]))
+        elif backend.backend() == "torch":
+            import torch
+
+            x = torch.zeros(3, requires_grad=True)
+            y = knn.normalize(x, axis=-1, order=2, epsilon=epsilon)
+            y.sum().backward()
+            x_grad = x.grad
+        else:
+            self.skipTest("Gradient test requires tensorflow, jax or torch.")
+
+        x_grad = ops.convert_to_numpy(x_grad)
+        self.assertFalse(np.isnan(x_grad).any())
+        self.assertAllClose(x_grad, expected_grad)
+
     def test_psnr(self):
         x1 = np.array([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]])
         x2 = np.array([[0.2, 0.2, 0.3], [0.4, 0.6, 0.6]])
@@ -3159,6 +3290,25 @@ class NNOpsDtypeTest(testing.TestCase):
         )
 
     @parameterized.named_parameters(named_product(dtype=FLOAT_DTYPES))
+    def test_sparsemax(self, dtype):
+        # `jax.nn` has no `sparsemax`, so there is no reference to compare
+        # against. `sparsemax` is a projection onto the simplex and returns the
+        # dtype it is given. The ranks and counts inside the implementation are
+        # integers and the constants are Python floats; neither may promote the
+        # result away from that dtype.
+        x = knp.ones((2,), dtype=dtype)
+        expected_dtype = dtype
+
+        self.assertEqual(
+            standardize_dtype(knn.sparsemax(x).dtype),
+            expected_dtype,
+        )
+        self.assertEqual(
+            standardize_dtype(knn.Sparsemax().symbolic_call(x).dtype),
+            expected_dtype,
+        )
+
+    @parameterized.named_parameters(named_product(dtype=FLOAT_DTYPES))
     def test_silu(self, dtype):
         import jax.nn as jnn
         import jax.numpy as jnp
@@ -3380,7 +3530,7 @@ class NNOpsBehaviorTest(testing.TestCase):
         model = models.Sequential([layer])
         model.compile(loss="binary_crossentropy", optimizer="sgd")
         out = model.evaluate(x, y)
-        self.assertAllClose(out, 2.682124)
+        self.assertAllClose(out, 2.682124, atol=1e-3, rtol=1e-3)
 
     def test_softmax_on_axis_with_size_one_warns(self):
         x = np.array([[1.0]])

@@ -350,6 +350,11 @@ class Distribution:
         raise NotImplementedError()
 
     @property
+    def num_data_shards(self):
+        """Total number of data shards."""
+        return min(self.num_model_replicas, self.num_processes)
+
+    @property
     def data_shard_id(self):
         """ID of the data shard for the current process."""
         num_model_replicas = self.num_model_replicas
@@ -815,9 +820,7 @@ def distribute_tensor(tensor, layout):
 @keras_export("keras.distribution.distribution")
 def distribution():
     """Retrieve the current distribution from global context."""
-    return getattr(
-        global_state.GLOBAL_STATE_TRACKER, GLOBAL_ATTRIBUTE_NAME, None
-    )
+    return global_state.get_global_attribute(GLOBAL_ATTRIBUTE_NAME)
 
 
 @keras_export("keras.distribution.set_distribution")
@@ -828,3 +831,9 @@ def set_distribution(value):
         value: a `Distribution` instance.
     """
     global_state.set_global_attribute(GLOBAL_ATTRIBUTE_NAME, value)
+    if value is not None:
+        if hasattr(distribution_lib, "activate_dtensor_promotion"):
+            distribution_lib.activate_dtensor_promotion()
+    else:
+        if hasattr(distribution_lib, "deactivate_dtensor_promotion"):
+            distribution_lib.deactivate_dtensor_promotion()
